@@ -55,18 +55,25 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
-    case tool do
-      @linear_graphql_tool ->
-        execute_linear_graphql(arguments, opts)
+    start_us = System.monotonic_time(:microsecond)
 
-      other ->
-        failure_response(%{
-          "error" => %{
-            "message" => "Unsupported dynamic tool: #{inspect(other)}.",
-            "supportedTools" => supported_tool_names()
-          }
-        })
-    end
+    result =
+      case tool do
+        @linear_graphql_tool ->
+          execute_linear_graphql(arguments, opts)
+
+        other ->
+          failure_response(%{
+            "error" => %{
+              "message" => "Unsupported dynamic tool: #{inspect(other)}.",
+              "supportedTools" => supported_tool_names()
+            }
+          })
+      end
+
+    elapsed_us = System.monotonic_time(:microsecond) - start_us
+    SymphonyElixir.BeamIntrospector.record_tool_execution(tool || "unknown", elapsed_us)
+    result
   end
 
   @spec tool_specs() :: [map()]

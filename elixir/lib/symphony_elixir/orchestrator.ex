@@ -7,15 +7,15 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, BeamIntrospector, Config, SessionLog, StatsPersistence, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
-  @max_session_stdout_entries 200
   @max_session_stdout_bytes 2_000
+  @stats_flush_interval_ms 30_000
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -41,7 +41,13 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil,
       codex_rate_limit_buckets: %{},
       codex_rate_limit_latest_bucket_key: nil,
-      codex_effective_model: nil
+      codex_effective_model: nil,
+      completed_sessions: [],
+      total_completed: 0,
+      total_failed: 0,
+      last_poll_duration_ms: nil,
+      last_poll_candidates: nil,
+      last_poll_dispatched: nil
     ]
   end
 
@@ -64,11 +70,20 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil,
       codex_rate_limit_buckets: %{},
       codex_rate_limit_latest_bucket_key: nil,
-      codex_effective_model: nil
+      codex_effective_model: nil,
+      completed_sessions: [],
+      total_completed: 0,
+      total_failed: 0,
+      last_poll_duration_ms: nil,
+      last_poll_candidates: nil,
+      last_poll_dispatched: nil
     }
+
+    state = restore_persisted_stats(state)
 
     run_terminal_workspace_cleanup()
     :ok = schedule_tick(0)
+    schedule_stats_flush()
 
     {:ok, state}
   end
@@ -83,14 +98,22 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info(:flush_stats, state) do
+    flush_stats_to_disk(state)
+    schedule_stats_flush()
+    {:noreply, state}
+  end
+
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    poll_start = System.monotonic_time(:millisecond)
     state = maybe_dispatch(state)
+    poll_duration = System.monotonic_time(:millisecond) - poll_start
     now_ms = System.monotonic_time(:millisecond)
     next_poll_due_at_ms = now_ms + state.poll_interval_ms
     :ok = schedule_tick(state.poll_interval_ms)
 
-    state = %{state | poll_check_in_progress: false, next_poll_due_at_ms: next_poll_due_at_ms}
+    state = %{state | poll_check_in_progress: false, next_poll_due_at_ms: next_poll_due_at_ms, last_poll_duration_ms: poll_duration}
 
     notify_dashboard()
     {:noreply, state}
@@ -109,12 +132,32 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
+        completed_now = DateTime.utc_now()
+
+        session_record = %{
+          identifier: running_entry.identifier,
+          issue_id: issue_id,
+          session_id: session_id,
+          started_at: running_entry.started_at,
+          completed_at: completed_now,
+          runtime_seconds: running_seconds(running_entry.started_at, completed_now),
+          input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+          output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+          total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+          turn_count: Map.get(running_entry, :turn_count, 0)
+        }
+
         state =
           case reason do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
+              record = Map.merge(session_record, %{outcome: :success})
+              completed_sessions = Enum.take([record | state.completed_sessions], 50)
+
               state
+              |> Map.put(:completed_sessions, completed_sessions)
+              |> Map.update!(:total_completed, &(&1 + 1))
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
@@ -124,9 +167,15 @@ defmodule SymphonyElixir.Orchestrator do
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
+              record = Map.merge(session_record, %{outcome: :failure, error: inspect(reason)})
+              completed_sessions = Enum.take([record | state.completed_sessions], 50)
+
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              state
+              |> Map.put(:completed_sessions, completed_sessions)
+              |> Map.update!(:total_failed, &(&1 + 1))
+              |> schedule_issue_retry(issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}"
               })
@@ -684,6 +733,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         maybe_move_to_in_progress(issue)
 
+        SessionLog.reset(issue.identifier)
+
         running =
           Map.put(state.running, issue.id, %{
             pid: pid,
@@ -701,7 +752,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
-            session_stdout: [],
+            stdout_line_count: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -991,6 +1042,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec reset_stats() :: :ok
+  def reset_stats, do: GenServer.call(__MODULE__, :reset_stats)
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1031,8 +1085,14 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
-          session_stdout: Map.get(metadata, :session_stdout, []),
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          stdout_line_count: Map.get(metadata, :stdout_line_count, 0),
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          pid: metadata.pid,
+          process_memory:
+            if(is_pid(metadata.pid) and Process.alive?(metadata.pid),
+              do: elem(Process.info(metadata.pid, :memory) || {:memory, 0}, 1),
+              else: 0
+            )
         }
       end)
 
@@ -1050,6 +1110,22 @@ defmodule SymphonyElixir.Orchestrator do
 
     {:reply,
      snapshot_payload(state, running, retrying, now_ms), state}
+  end
+
+  def handle_call(:reset_stats, _from, state) do
+    BeamIntrospector.reset_tool_stats()
+    StatsPersistence.delete()
+
+    state = %{
+      state
+      | codex_totals: @empty_codex_totals,
+        total_completed: 0,
+        total_failed: 0,
+        completed_sessions: []
+    }
+
+    notify_dashboard()
+    {:reply, :ok, state}
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -1077,6 +1153,8 @@ defmodule SymphonyElixir.Orchestrator do
     {rate_limit_buckets, selected_rate_limits} =
       snapshot_rate_limit_buckets(state, requested_model, effective_model)
 
+    total_sessions = state.total_completed + state.total_failed
+
     %{
       running: running,
       retrying: retrying,
@@ -1091,6 +1169,21 @@ defmodule SymphonyElixir.Orchestrator do
         checking?: state.poll_check_in_progress == true,
         next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
         poll_interval_ms: state.poll_interval_ms
+      },
+      completed_sessions: Enum.take(state.completed_sessions, 50),
+      session_stats: %{
+        total_completed: state.total_completed,
+        total_failed: state.total_failed,
+        success_rate:
+          if(total_sessions > 0,
+            do: Float.round(state.total_completed / total_sessions * 100, 1),
+            else: 0.0
+          )
+      },
+      poll_stats: %{
+        last_duration_ms: state.last_poll_duration_ms,
+        interval_ms: state.poll_interval_ms,
+        checking?: state.poll_check_in_progress == true
       }
     }
   end
@@ -1105,7 +1198,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
-    session_stdout = session_stdout_for_update(Map.get(running_entry, :session_stdout, []), update)
+    stdout_line_count = append_stdout_to_file(running_entry, update)
 
     {
       Map.merge(running_entry, %{
@@ -1121,7 +1214,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update),
-        session_stdout: session_stdout
+        stdout_line_count: stdout_line_count
       }),
       token_delta
     }
@@ -1171,33 +1264,42 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp session_stdout_for_update(session_stdout, update) when is_list(session_stdout) do
-    case stdout_entry_from_update(update) do
+  # Events to skip from the session stdout trace
+  @stdout_skip_events [:session_started, :startup_failed]
+
+  defp append_stdout_to_file(running_entry, update) do
+    current_count = Map.get(running_entry, :stdout_line_count, 0)
+
+    case stdout_text_from_update(update) do
       nil ->
-        session_stdout
+        current_count
 
-      stdout_entry ->
-        appended = session_stdout ++ [stdout_entry]
-        overflow = length(appended) - @max_session_stdout_entries
+      text ->
+        identifier = running_entry.identifier
+        timestamp = update_timestamp(update)
 
-        if overflow > 0 do
-          Enum.drop(appended, overflow)
-        else
-          appended
+        case SessionLog.append(identifier, timestamp, text) do
+          {:ok, count} -> count
+          :error -> current_count
         end
     end
   end
 
-  defp session_stdout_for_update(_session_stdout, update), do: session_stdout_for_update([], update)
+  defp stdout_text_from_update(%{event: event}) when event in @stdout_skip_events, do: nil
 
-  defp stdout_entry_from_update(%{event: :malformed} = update) do
-    case sanitize_session_stdout_text(update[:payload] || update[:raw]) do
-      nil -> nil
-      text -> %{timestamp: update_timestamp(update), text: text}
-    end
+  defp stdout_text_from_update(%{event: :malformed} = update) do
+    sanitize_session_stdout_text(update[:payload] || update[:raw])
   end
 
-  defp stdout_entry_from_update(_update), do: nil
+  defp stdout_text_from_update(%{event: event} = update) do
+    message = summarize_codex_update(update)
+    text = StatusDashboard.humanize_codex_message(message)
+
+    case sanitize_session_stdout_text(text) do
+      nil -> nil
+      sanitized -> "[#{event}] #{sanitized}"
+    end
+  end
 
   defp update_timestamp(%{timestamp: %DateTime{} = timestamp}), do: timestamp
   defp update_timestamp(_update), do: DateTime.utc_now()
@@ -2039,4 +2141,97 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  # ── Stats persistence ──────────────────────────────────────────────
+
+  @impl true
+  def terminate(_reason, state) do
+    flush_stats_to_disk(state)
+    :ok
+  end
+
+  defp restore_persisted_stats(state) do
+    case StatsPersistence.load() do
+      {:ok, %{} = persisted} ->
+        codex_totals =
+          case Map.get(persisted, "codex_totals") do
+            %{} = ct ->
+              %{
+                input_tokens: Map.get(ct, "input_tokens", 0),
+                output_tokens: Map.get(ct, "output_tokens", 0),
+                total_tokens: Map.get(ct, "total_tokens", 0),
+                seconds_running: Map.get(ct, "seconds_running", 0)
+              }
+
+            _ ->
+              @empty_codex_totals
+          end
+
+        completed_sessions =
+          persisted
+          |> Map.get("completed_sessions", [])
+          |> Enum.take(50)
+          |> Enum.map(&restore_session_record/1)
+
+        %{
+          state
+          | codex_totals: codex_totals,
+            total_completed: Map.get(persisted, "total_completed", 0),
+            total_failed: Map.get(persisted, "total_failed", 0),
+            completed_sessions: completed_sessions
+        }
+
+      _ ->
+        state
+    end
+  end
+
+  defp restore_session_record(record) when is_map(record) do
+    %{
+      identifier: Map.get(record, "identifier"),
+      issue_id: Map.get(record, "issue_id"),
+      session_id: Map.get(record, "session_id"),
+      started_at: parse_persisted_datetime(Map.get(record, "started_at")),
+      completed_at: parse_persisted_datetime(Map.get(record, "completed_at")),
+      runtime_seconds: Map.get(record, "runtime_seconds", 0),
+      input_tokens: Map.get(record, "input_tokens", 0),
+      output_tokens: Map.get(record, "output_tokens", 0),
+      total_tokens: Map.get(record, "total_tokens", 0),
+      turn_count: Map.get(record, "turn_count", 0),
+      outcome: restore_outcome(Map.get(record, "outcome")),
+      error: Map.get(record, "error")
+    }
+  end
+
+  defp restore_session_record(_record), do: nil
+
+  defp restore_outcome("success"), do: :success
+  defp restore_outcome("failure"), do: :failure
+  defp restore_outcome(_), do: :unknown
+
+  defp parse_persisted_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _} -> dt
+      _ -> nil
+    end
+  end
+
+  defp parse_persisted_datetime(_), do: nil
+
+  defp flush_stats_to_disk(state) do
+    tool_stats = BeamIntrospector.tool_execution_stats()
+
+    StatsPersistence.save(%{
+      codex_totals: state.codex_totals,
+      total_completed: state.total_completed,
+      total_failed: state.total_failed,
+      completed_sessions: Enum.take(state.completed_sessions, 50),
+      tool_stats: tool_stats,
+      persisted_at: DateTime.utc_now() |> DateTime.to_iso8601()
+    })
+  end
+
+  defp schedule_stats_flush do
+    Process.send_after(self(), :flush_stats, @stats_flush_interval_ms)
+  end
 end

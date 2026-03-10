@@ -138,6 +138,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       started_at: started_at
     }
 
+    SymphonyElixir.SessionLog.reset(issue.identifier)
+
     :sys.replace_state(pid, fn _ ->
       initial_state
       |> Map.put(:running, %{issue_id => running_entry})
@@ -159,9 +161,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     snapshot = GenServer.call(pid, :snapshot)
     assert %{running: [snapshot_entry]} = snapshot
 
-    assert snapshot_entry.session_stdout == [
-             %{timestamp: timestamp, text: "stdout line from codex"}
-           ]
+    assert snapshot_entry.stdout_line_count == 1
+
+    # Verify the log was persisted to disk
+    log_entries = SymphonyElixir.SessionLog.read_all("MT-189")
+    assert [%{"text" => "stdout line from codex"}] = log_entries
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

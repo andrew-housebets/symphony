@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{BeamIntrospector, Config, Orchestrator, StatusDashboard}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -25,7 +25,11 @@ defmodule SymphonyElixirWeb.Presenter do
           requested_model: Map.get(snapshot, :requested_model),
           effective_model: Map.get(snapshot, :effective_model),
           rate_limit_bucket_id: Map.get(snapshot, :rate_limit_bucket_id),
-          rate_limit_bucket_model: Map.get(snapshot, :rate_limit_bucket_model)
+          rate_limit_bucket_model: Map.get(snapshot, :rate_limit_bucket_model),
+          beam: BeamIntrospector.snapshot(),
+          completed_sessions: Map.get(snapshot, :completed_sessions, []),
+          session_stats: Map.get(snapshot, :session_stats, %{total_completed: 0, total_failed: 0, success_rate: 0.0}),
+          poll_stats: Map.get(snapshot, :poll_stats, %{})
         }
 
       :timeout ->
@@ -80,7 +84,7 @@ defmodule SymphonyElixirWeb.Presenter do
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
       logs: %{
-        codex_session_logs: codex_session_logs_payload(running)
+        codex_session_logs: []
       },
       recent_events: (running && recent_events_payload(running)) || [],
       last_error: retry && retry.error,
@@ -110,12 +114,13 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
-      stdout: codex_session_logs_payload(entry),
+      stdout_line_count: Map.get(entry, :stdout_line_count, 0),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      process_memory: Map.get(entry, :process_memory, 0)
     }
   end
 
@@ -176,24 +181,6 @@ defmodule SymphonyElixirWeb.Presenter do
     ]
     |> Enum.reject(&is_nil(&1.at))
   end
-
-  defp codex_session_logs_payload(nil), do: []
-
-  defp codex_session_logs_payload(%{session_stdout: session_stdout}) do
-    session_stdout
-    |> List.wrap()
-    |> Enum.map(&session_stdout_entry_payload/1)
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp codex_session_logs_payload(_running_entry), do: []
-
-  defp session_stdout_entry_payload(%{text: text} = entry) when is_binary(text) do
-    timestamp = Map.get(entry, :timestamp)
-    %{at: iso8601(timestamp), text: text}
-  end
-
-  defp session_stdout_entry_payload(_entry), do: nil
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)

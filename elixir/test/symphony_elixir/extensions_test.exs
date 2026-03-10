@@ -482,16 +482,13 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
-  test "phoenix observability API exposes captured session stdout in state and issue payloads" do
+  test "phoenix observability API exposes stdout_line_count in state and issue payloads" do
     [running_entry] = static_snapshot().running
 
     snapshot = %{
       static_snapshot()
       | running: [
-          Map.put(running_entry, :session_stdout, [
-            %{timestamp: ~U[2026-03-10 10:00:00Z], text: "stdout hello"},
-            %{timestamp: ~U[2026-03-10 10:00:01Z], text: "stdout world"}
-          ])
+          Map.put(running_entry, :stdout_line_count, 5)
         ]
     }
 
@@ -509,19 +506,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
     [running_payload] = state_payload["running"]
 
-    assert running_payload["stdout"] == [
-             %{"at" => "2026-03-10T10:00:00Z", "text" => "stdout hello"},
-             %{"at" => "2026-03-10T10:00:01Z", "text" => "stdout world"}
-           ]
-
-    issue_payload = json_response(get(build_conn(), "/api/v1/MT-HTTP"), 200)
-
-    assert issue_payload["logs"] == %{
-             "codex_session_logs" => [
-               %{"at" => "2026-03-10T10:00:00Z", "text" => "stdout hello"},
-               %{"at" => "2026-03-10T10:00:01Z", "text" => "stdout world"}
-             ]
-           }
+    assert running_payload["stdout_line_count"] == 5
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do

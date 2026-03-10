@@ -313,6 +313,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              retrying: retrying,
              codex_totals: codex_totals,
+             token_budget: Map.get(snapshot, :token_budget),
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
            }},
@@ -333,6 +334,7 @@ defmodule SymphonyElixir.StatusDashboard do
         rate_limits = Map.get(snapshot, :rate_limits)
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
+        budget_line = format_budget_line(Map.get(snapshot, :token_budget))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
@@ -359,6 +361,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize("out #{format_count(codex_output_tokens)}", @ansi_yellow) <>
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
+           budget_line,
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
@@ -558,6 +561,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              retrying: retrying,
              codex_totals: codex_totals,
+             token_budget: Map.get(snapshot, :token_budget),
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
            }}
@@ -595,7 +599,11 @@ defmodule SymphonyElixir.StatusDashboard do
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
-    event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
+
+    event_label =
+      running_entry
+      |> summarize_running_budget_message()
+      |> format_cell(running_event_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
 
@@ -697,6 +705,38 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_retry_error(_), do: ""
+
+  defp format_budget_line(%{enabled: true, suppressed_issues: suppressed_issues}) when is_list(suppressed_issues) do
+    suppressed_count = length(suppressed_issues)
+
+    if suppressed_count > 0 do
+      [
+        colorize("│ Budget: ", @ansi_bold) <>
+          colorize("suppressed #{suppressed_count}", @ansi_red)
+      ]
+    else
+      []
+    end
+  end
+
+  defp format_budget_line(_token_budget), do: []
+
+  defp summarize_running_budget_message(running_entry) do
+    message = summarize_message(running_entry.last_codex_message)
+    hard_limit = Map.get(running_entry, :budget_hard_limit)
+    soft_limits = Map.get(running_entry, :budget_soft_limits, [])
+
+    cond do
+      is_atom(hard_limit) and not is_nil(hard_limit) ->
+        "#{message} [budget #{hard_limit}]"
+
+      soft_limits != [] ->
+        "#{message} [budget warn]"
+
+      true ->
+        message
+    end
+  end
 
   defp format_runtime_seconds(seconds) when is_integer(seconds) do
     mins = div(seconds, 60)
@@ -983,8 +1023,13 @@ defmodule SymphonyElixir.StatusDashboard do
         bar = format_progress_bar(pct, 15)
         color = if pct >= 90, do: @ansi_red, else: if(pct >= 70, do: @ansi_orange, else: @ansi_green)
 
-        [colorize(bar, color) <> " " <> colorize("#{pct}%", color) <>
-          colorize(" (#{format_count(remaining)}/#{format_count(limit)})", @ansi_gray) | parts]
+        [
+          colorize(bar, color) <>
+            " " <>
+            colorize("#{pct}%", color) <>
+            colorize(" (#{format_count(remaining)}/#{format_count(limit)})", @ansi_gray)
+          | parts
+        ]
       else
         cond do
           integer_like?(remaining) -> [colorize("remaining #{format_count(remaining)}", @ansi_cyan) | parts]
@@ -1007,7 +1052,7 @@ defmodule SymphonyElixir.StatusDashboard do
     parts =
       cond do
         is_integer(reset_seconds) and reset_seconds > 0 ->
-          reset_dt = DateTime.add(DateTime.utc_now(), reset_seconds, :second)
+          reset_dt = DateTime.add(rate_limit_reference_now(), reset_seconds, :second)
           [colorize("resets #{format_datetime_short(reset_dt)}", @ansi_gray) | parts]
 
         is_binary(reset_at) ->
@@ -1043,6 +1088,13 @@ defmodule SymphonyElixir.StatusDashboard do
     Calendar.strftime(dt, "%H:%M:%S UTC")
   end
 
+  defp rate_limit_reference_now do
+    case Application.get_env(:symphony_elixir, :status_dashboard_now) do
+      %DateTime{} = dt -> dt
+      _ -> DateTime.utc_now()
+    end
+  end
+
   defp format_rate_limit_credits(nil), do: "credits n/a"
 
   defp format_rate_limit_credits(credits) when is_map(credits) do
@@ -1066,7 +1118,6 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_rate_limit_credits(other), do: "credits #{to_string(other)}"
-
 
   defp format_number(value) when is_integer(value), do: format_count(value)
 

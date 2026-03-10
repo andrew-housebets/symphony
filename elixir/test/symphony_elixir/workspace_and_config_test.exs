@@ -669,6 +669,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: nil,
       max_concurrent_agents: nil,
+      continuation_retry_ms: nil,
       codex_approval_policy: nil,
       codex_thread_sandbox: nil,
       codex_turn_sandbox_policy: nil,
@@ -684,6 +685,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.linear_project_slug() == nil
     assert Config.workspace_root() == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert Config.max_concurrent_agents() == 10
+    assert Config.continuation_retry_ms() == 60_000
+
+    assert Config.token_budget_settings() == %{
+             enabled: true,
+             per_turn_soft_tokens: 150_000,
+             per_turn_hard_tokens: 250_000,
+             per_run_soft_tokens: 400_000,
+             per_run_hard_tokens: 600_000,
+             per_issue_window_soft_tokens: 1_000_000,
+             per_issue_window_hard_tokens: 1_500_000,
+             issue_window_seconds: 86_400,
+             comment_on_enforcement: true,
+             pause_on_hard_limit: true
+           }
+
     assert Config.codex_command() == "codex app-server"
 
     assert Config.codex_approval_policy() == %{
@@ -715,7 +731,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_approval_policy: "on-request",
       codex_thread_sandbox: "workspace-write",
-      codex_turn_sandbox_policy: %{type: "workspaceWrite", writableRoots: ["/tmp/workspace", "/tmp/cache"]}
+      codex_turn_sandbox_policy: %{type: "workspaceWrite", writableRoots: ["/tmp/workspace", "/tmp/cache"]},
+      token_budget: %{
+        enabled: false,
+        per_turn_soft_tokens: 12_345,
+        per_turn_hard_tokens: 23_456,
+        per_run_soft_tokens: 34_567,
+        per_run_hard_tokens: 45_678,
+        per_issue_window_soft_tokens: 56_789,
+        per_issue_window_hard_tokens: 67_890,
+        issue_window_seconds: 3_600,
+        comment_on_enforcement: false,
+        pause_on_hard_limit: false
+      }
     )
 
     assert Config.codex_approval_policy() == "on-request"
@@ -728,6 +756,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "/tmp/workspace",
                "/tmp/cache"
              ]
+           }
+
+    assert Config.token_budget_settings() == %{
+             enabled: false,
+             per_turn_soft_tokens: 12_345,
+             per_turn_hard_tokens: 23_456,
+             per_run_soft_tokens: 34_567,
+             per_run_hard_tokens: 45_678,
+             per_issue_window_soft_tokens: 56_789,
+             per_issue_window_hard_tokens: 67_890,
+             issue_window_seconds: 3_600,
+             comment_on_enforcement: false,
+             pause_on_hard_limit: false
            }
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_turn_sandbox_policy: %{type: "workspaceWrite"})
@@ -774,6 +815,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       poll_interval_ms: %{bad: true},
       workspace_root: 123,
       max_retry_backoff_ms: 0,
+      continuation_retry_ms: 0,
+      token_budget: %{
+        enabled: "bad",
+        per_turn_soft_tokens: 0,
+        per_turn_hard_tokens: 0,
+        per_run_soft_tokens: -1,
+        per_run_hard_tokens: "bad",
+        per_issue_window_soft_tokens: 0,
+        per_issue_window_hard_tokens: nil,
+        issue_window_seconds: 0,
+        comment_on_enforcement: "bad",
+        pause_on_hard_limit: "bad"
+      },
       max_concurrent_agents_by_state: %{"Todo" => "1", "Review" => 0, "Done" => "bad"},
       hook_timeout_ms: 0,
       observability_enabled: "maybe",
@@ -789,6 +843,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.poll_interval_ms() == 30_000
     assert Config.workspace_root() == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert Config.max_retry_backoff_ms() == 300_000
+    assert Config.continuation_retry_ms() == 60_000
+
+    assert Config.token_budget_settings() == %{
+             enabled: true,
+             per_turn_soft_tokens: 150_000,
+             per_turn_hard_tokens: 250_000,
+             per_run_soft_tokens: 400_000,
+             per_run_hard_tokens: 600_000,
+             per_issue_window_soft_tokens: 1_000_000,
+             per_issue_window_hard_tokens: 1_500_000,
+             issue_window_seconds: 86_400,
+             comment_on_enforcement: true,
+             pause_on_hard_limit: true
+           }
+
     assert Config.max_concurrent_agents_for_state("Todo") == 1
     assert Config.max_concurrent_agents_for_state("Review") == 10
     assert Config.hook_timeout_ms() == 60_000

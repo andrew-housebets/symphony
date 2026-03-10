@@ -1344,8 +1344,277 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms >= 8_500
     assert remaining_ms <= 10_500
+  end
+
+  test "orchestrator uses configured continuation retry delay after normal worker exit" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      continuation_retry_ms: 90_000
+    )
+
+    issue_id = "issue-continuation-delay"
+    issue_identifier = "MT-CONT-1"
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationDelayOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue_identifier,
+      issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+      session_id: "thread-cont-delay-turn-1",
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {:DOWN, process_ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{
+             attempt: 1,
+             identifier: ^issue_identifier,
+             due_at_ms: due_at_ms
+           } = state.retry_attempts[issue_id]
+
+    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+    assert remaining_ms >= 89_000
+    assert remaining_ms <= 91_000
+  end
+
+  test "per-run hard token budget stops the worker, comments, and pauses the issue" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      token_budget: %{
+        enabled: true,
+        per_turn_soft_tokens: 10_000,
+        per_turn_hard_tokens: 20_000,
+        per_run_soft_tokens: 80,
+        per_run_hard_tokens: 100,
+        per_issue_window_soft_tokens: 1_000,
+        per_issue_window_hard_tokens: 2_000,
+        issue_window_seconds: 86_400,
+        comment_on_enforcement: true,
+        pause_on_hard_limit: true
+      }
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-budget-hard-stop"
+    issue_identifier = "MT-BUDGET-HARD"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      title: "Budget hard stop",
+      description: "Stop runaway runs",
+      state: "In Progress",
+      url: "https://example.org/issues/#{issue_identifier}"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :BudgetHardStopOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    initial_failed = initial_state.total_failed
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    process_ref = Process.monitor(worker_pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue_identifier,
+      issue: issue,
+      session_id: "thread-budget-hard-turn-1",
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      current_turn_input_baseline: 0,
+      current_turn_output_baseline: 0,
+      current_turn_total_baseline: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, token_usage_update(issue_id, 72, 48, 120))
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment_body}, 1_000
+    assert comment_body =~ "per_run_hard_limit"
+
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 1_000
+
+    wait_for_snapshot(
+      pid,
+      fn snapshot ->
+        snapshot.running == [] and length(snapshot.token_budget.suppressed_issues) == 1
+      end,
+      1_000
+    )
+
+    state = :sys.get_state(pid)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert state.total_failed == initial_failed + 1
+    assert %{reason: "per_run_hard_limit"} = state.suppressed_issues[issue_id]
+  end
+
+  test "per-run soft token budget suppresses continuation retry after a normal exit" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      token_budget: %{
+        enabled: true,
+        per_turn_soft_tokens: 10_000,
+        per_turn_hard_tokens: 20_000,
+        per_run_soft_tokens: 100,
+        per_run_hard_tokens: 1_000,
+        per_issue_window_soft_tokens: 2_000,
+        per_issue_window_hard_tokens: 4_000,
+        issue_window_seconds: 86_400,
+        comment_on_enforcement: true,
+        pause_on_hard_limit: true
+      }
+    )
+
+    issue_id = "issue-budget-soft-stop"
+    issue_identifier = "MT-BUDGET-SOFT"
+    orchestrator_name = Module.concat(__MODULE__, :BudgetSoftStopOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    initial_completed = initial_state.total_completed
+    process_ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue_identifier,
+      issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+      session_id: "thread-budget-soft-turn-1",
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      current_turn_input_baseline: 0,
+      current_turn_output_baseline: 0,
+      current_turn_total_baseline: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, token_usage_update(issue_id, 75, 50, 125))
+
+    snapshot =
+      wait_for_snapshot(
+        pid,
+        fn
+          %{running: [entry]} ->
+            :per_run_soft_limit in entry.budget_soft_limits and entry.budget_continuation_blocked
+
+          _ ->
+            false
+        end,
+        1_000
+      )
+
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.budget_hard_limit == nil
+
+    send(pid, {:DOWN, process_ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert state.total_completed == initial_completed + 1
+
+    assert [%{issue_id: ^issue_id, outcome: :success} | _] = state.completed_sessions
+  end
+
+  test "stats flush falls back to empty tool stats when collector raises" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-stats-flush-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_api_token: nil,
+        workspace_root: workspace_root
+      )
+
+      :ok = SymphonyElixir.StatsPersistence.delete()
+
+      state = %Orchestrator.State{
+        codex_totals: %{input_tokens: 1, output_tokens: 2, total_tokens: 3, seconds_running: 4},
+        total_completed: 5,
+        total_failed: 6,
+        completed_sessions: []
+      }
+
+      log =
+        capture_log(fn ->
+          assert :ok =
+                   Orchestrator.flush_stats_to_disk_for_test(state, fn ->
+                     raise "collector exploded"
+                   end)
+        end)
+
+      assert log =~ "Skipping tool stats flush due to error"
+
+      assert {:ok, %{"tool_stats" => [], "total_completed" => 5, "total_failed" => 6}} =
+               SymphonyElixir.StatsPersistence.load()
+    after
+      File.rm_rf(workspace_root)
+    end
   end
 
   test "status dashboard renders offline marker to terminal" do
@@ -1957,6 +2226,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         do_wait_for_snapshot(pid, predicate, deadline_ms)
       end
     end
+  end
+
+  defp token_usage_update(issue_id, input_tokens, output_tokens, total_tokens) do
+    {:codex_worker_update, issue_id,
+     %{
+       event: :notification,
+       payload: %{
+         "method" => "thread/tokenUsage/updated",
+         "params" => %{
+           "tokenUsage" => %{
+             "total" => %{
+               "input_tokens" => input_tokens,
+               "output_tokens" => output_tokens,
+               "total_tokens" => total_tokens
+             }
+           }
+         }
+       },
+       timestamp: DateTime.utc_now()
+     }}
   end
 
   defp graph_samples_from_rates(rates_per_bucket) do

@@ -29,6 +29,19 @@ defmodule SymphonyElixir.Config do
   @default_max_concurrent_agents 10
   @default_agent_max_turns 20
   @default_max_retry_backoff_ms 300_000
+  @default_continuation_retry_ms 60_000
+  @default_token_budget %{
+    enabled: true,
+    per_turn_soft_tokens: 150_000,
+    per_turn_hard_tokens: 250_000,
+    per_run_soft_tokens: 400_000,
+    per_run_hard_tokens: 600_000,
+    per_issue_window_soft_tokens: 1_000_000,
+    per_issue_window_hard_tokens: 1_500_000,
+    issue_window_seconds: 86_400,
+    comment_on_enforcement: true,
+    pause_on_hard_limit: true
+  }
   @default_codex_command "codex app-server"
   @default_codex_turn_timeout_ms 3_600_000
   @default_codex_read_timeout_ms 5_000
@@ -98,6 +111,56 @@ defmodule SymphonyElixir.Config do
                                  max_retry_backoff_ms: [
                                    type: :pos_integer,
                                    default: @default_max_retry_backoff_ms
+                                 ],
+                                 continuation_retry_ms: [
+                                   type: :pos_integer,
+                                   default: @default_continuation_retry_ms
+                                 ],
+                                 token_budget: [
+                                   type: :map,
+                                   default: %{},
+                                   keys: [
+                                     enabled: [
+                                       type: :boolean,
+                                       default: @default_token_budget.enabled
+                                     ],
+                                     per_turn_soft_tokens: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.per_turn_soft_tokens
+                                     ],
+                                     per_turn_hard_tokens: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.per_turn_hard_tokens
+                                     ],
+                                     per_run_soft_tokens: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.per_run_soft_tokens
+                                     ],
+                                     per_run_hard_tokens: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.per_run_hard_tokens
+                                     ],
+                                     per_issue_window_soft_tokens: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.per_issue_window_soft_tokens
+                                     ],
+                                     per_issue_window_hard_tokens: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.per_issue_window_hard_tokens
+                                     ],
+                                     issue_window_seconds: [
+                                       type: :pos_integer,
+                                       default: @default_token_budget.issue_window_seconds
+                                     ],
+                                     comment_on_enforcement: [
+                                       type: :boolean,
+                                       default: @default_token_budget.comment_on_enforcement
+                                     ],
+                                     pause_on_hard_limit: [
+                                       type: :boolean,
+                                       default: @default_token_budget.pause_on_hard_limit
+                                     ]
+                                   ]
                                  ],
                                  max_concurrent_agents_by_state: [
                                    type: {:map, :string, :pos_integer},
@@ -176,6 +239,18 @@ defmodule SymphonyElixir.Config do
           after_run: String.t() | nil,
           before_remove: String.t() | nil,
           timeout_ms: pos_integer()
+        }
+  @type token_budget_settings :: %{
+          enabled: boolean(),
+          per_turn_soft_tokens: pos_integer(),
+          per_turn_hard_tokens: pos_integer(),
+          per_run_soft_tokens: pos_integer(),
+          per_run_hard_tokens: pos_integer(),
+          per_issue_window_soft_tokens: pos_integer(),
+          per_issue_window_hard_tokens: pos_integer(),
+          issue_window_seconds: pos_integer(),
+          comment_on_enforcement: boolean(),
+          pause_on_hard_limit: boolean()
         }
 
   @spec current_workflow() :: {:ok, workflow_payload()} | {:error, term()}
@@ -267,6 +342,16 @@ defmodule SymphonyElixir.Config do
   @spec max_retry_backoff_ms() :: pos_integer()
   def max_retry_backoff_ms do
     get_in(validated_workflow_options(), [:agent, :max_retry_backoff_ms])
+  end
+
+  @spec continuation_retry_ms() :: pos_integer()
+  def continuation_retry_ms do
+    get_in(validated_workflow_options(), [:agent, :continuation_retry_ms])
+  end
+
+  @spec token_budget_settings() :: token_budget_settings()
+  def token_budget_settings do
+    get_in(validated_workflow_options(), [:agent, :token_budget])
   end
 
   @spec agent_max_turns() :: pos_integer()
@@ -493,6 +578,8 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:max_concurrent_agents, integer_value(Map.get(section, "max_concurrent_agents")))
     |> put_if_present(:max_turns, positive_integer_value(Map.get(section, "max_turns")))
     |> put_if_present(:max_retry_backoff_ms, positive_integer_value(Map.get(section, "max_retry_backoff_ms")))
+    |> put_if_present(:continuation_retry_ms, positive_integer_value(Map.get(section, "continuation_retry_ms")))
+    |> put_if_present(:token_budget, token_budget_value(Map.get(section, "token_budget")))
     |> put_if_present(
       :max_concurrent_agents_by_state,
       state_limits_value(Map.get(section, "max_concurrent_agents_by_state"))
@@ -669,6 +756,59 @@ defmodule SymphonyElixir.Config do
   end
 
   defp state_limits_value(_value), do: :omit
+
+  defp token_budget_value(value) when is_map(value) do
+    %{}
+    |> put_if_present(:enabled, boolean_value(map_get_any(value, ["enabled", :enabled])))
+    |> put_if_present(
+      :per_turn_soft_tokens,
+      positive_integer_value(map_get_any(value, ["per_turn_soft_tokens", :per_turn_soft_tokens]))
+    )
+    |> put_if_present(
+      :per_turn_hard_tokens,
+      positive_integer_value(map_get_any(value, ["per_turn_hard_tokens", :per_turn_hard_tokens]))
+    )
+    |> put_if_present(
+      :per_run_soft_tokens,
+      positive_integer_value(map_get_any(value, ["per_run_soft_tokens", :per_run_soft_tokens]))
+    )
+    |> put_if_present(
+      :per_run_hard_tokens,
+      positive_integer_value(map_get_any(value, ["per_run_hard_tokens", :per_run_hard_tokens]))
+    )
+    |> put_if_present(
+      :per_issue_window_soft_tokens,
+      positive_integer_value(map_get_any(value, ["per_issue_window_soft_tokens", :per_issue_window_soft_tokens]))
+    )
+    |> put_if_present(
+      :per_issue_window_hard_tokens,
+      positive_integer_value(map_get_any(value, ["per_issue_window_hard_tokens", :per_issue_window_hard_tokens]))
+    )
+    |> put_if_present(
+      :issue_window_seconds,
+      positive_integer_value(map_get_any(value, ["issue_window_seconds", :issue_window_seconds]))
+    )
+    |> put_if_present(
+      :comment_on_enforcement,
+      boolean_value(map_get_any(value, ["comment_on_enforcement", :comment_on_enforcement]))
+    )
+    |> put_if_present(
+      :pause_on_hard_limit,
+      boolean_value(map_get_any(value, ["pause_on_hard_limit", :pause_on_hard_limit]))
+    )
+  end
+
+  defp token_budget_value(_value), do: :omit
+
+  defp map_get_any(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      if Map.has_key?(map, key), do: {:ok, Map.get(map, key)}, else: nil
+    end)
+    |> case do
+      {:ok, value} -> value
+      _ -> nil
+    end
+  end
 
   defp parse_integer(value) when is_integer(value), do: {:ok, value}
 

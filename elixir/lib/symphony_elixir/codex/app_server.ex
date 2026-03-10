@@ -298,6 +298,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
+
+      {:symphony_cancel_turn, reason} ->
+        {:error, {:turn_cancelled, reason}}
     after
       timeout_ms ->
         {:error, :turn_timeout}
@@ -834,6 +837,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
+
+      {:symphony_cancel_turn, reason} ->
+        {:error, {:turn_cancelled, reason}}
     after
       timeout_ms ->
         {:error, :response_timeout}
@@ -945,7 +951,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
-    Port.command(port, line)
+
+    case :erlang.port_info(port) do
+      :undefined ->
+        :ok
+
+      _ ->
+        try do
+          Port.command(port, line)
+        rescue
+          ArgumentError -> :ok
+        end
+    end
   end
 
   defp needs_input?(method, payload)

@@ -51,11 +51,45 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
     with {:ok, session} <- AppServer.start_session(workspace) do
+      recipient_watcher = maybe_start_recipient_watcher(session, codex_update_recipient, issue)
+
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
+        stop_recipient_watcher(recipient_watcher)
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp maybe_start_recipient_watcher(_session, recipient, _issue) when not is_pid(recipient), do: nil
+
+  defp maybe_start_recipient_watcher(_session, recipient, issue) do
+    owner = self()
+    spawn(fn -> watch_recipient_lifecycle(recipient, owner, issue) end)
+  end
+
+  defp stop_recipient_watcher(nil), do: :ok
+  defp stop_recipient_watcher(pid) when is_pid(pid), do: send(pid, :stop)
+
+  defp watch_recipient_lifecycle(recipient, owner, issue) when is_pid(recipient) and is_pid(owner) do
+    recipient_ref = Process.monitor(recipient)
+    owner_ref = Process.monitor(owner)
+
+    receive do
+      {:DOWN, ^recipient_ref, :process, _pid, reason} ->
+        Logger.warning("Codex update recipient exited for #{issue_context(issue)} reason=#{inspect(reason)}; cancelling codex turn")
+
+        send(owner, {:symphony_cancel_turn, {:codex_update_recipient_down, reason}})
+        Process.demonitor(owner_ref, [:flush])
+
+      {:DOWN, ^owner_ref, :process, _pid, _reason} ->
+        Process.demonitor(recipient_ref, [:flush])
+
+      :stop ->
+        Process.demonitor(recipient_ref, [:flush])
+        Process.demonitor(owner_ref, [:flush])
+        :ok
     end
   end
 

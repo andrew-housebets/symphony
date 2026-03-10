@@ -10,7 +10,6 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, BeamIntrospector, Config, SessionLog, StatsPersistence, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
-  @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -42,6 +41,8 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limit_buckets: %{},
       codex_rate_limit_latest_bucket_key: nil,
       codex_effective_model: nil,
+      budget_events: [],
+      suppressed_issues: %{},
       completed_sessions: [],
       total_completed: 0,
       total_failed: 0,
@@ -58,8 +59,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
+    maybe_cleanup_orphaned_task_workers(Keyword.get(opts, :name, __MODULE__))
 
     state = %State{
       poll_interval_ms: Config.poll_interval_ms(),
@@ -71,6 +73,8 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limit_buckets: %{},
       codex_rate_limit_latest_bucket_key: nil,
       codex_effective_model: nil,
+      budget_events: [],
+      suppressed_issues: %{},
       completed_sessions: [],
       total_completed: 0,
       total_failed: 0,
@@ -79,7 +83,10 @@ defmodule SymphonyElixir.Orchestrator do
       last_poll_dispatched: nil
     }
 
-    state = restore_persisted_stats(state)
+    state =
+      state
+      |> restore_persisted_stats()
+      |> prune_budget_state()
 
     run_terminal_workspace_cleanup()
     :ok = schedule_tick(0)
@@ -154,15 +161,13 @@ defmodule SymphonyElixir.Orchestrator do
 
               record = Map.merge(session_record, %{outcome: :success})
               completed_sessions = Enum.take([record | state.completed_sessions], 50)
+              state = record_budget_event(state, running_entry, :success, nil, completed_now)
 
               state
               |> Map.put(:completed_sessions, completed_sessions)
               |> Map.update!(:total_completed, &(&1 + 1))
               |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation
-              })
+              |> maybe_schedule_continuation_retry(issue_id, running_entry)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -171,6 +176,15 @@ defmodule SymphonyElixir.Orchestrator do
               completed_sessions = Enum.take([record | state.completed_sessions], 50)
 
               next_attempt = next_retry_attempt_from_running(running_entry)
+
+              state =
+                record_budget_event(
+                  state,
+                  running_entry,
+                  :failure,
+                  Map.get(running_entry, :budget_stop_reason) || "agent exited: #{inspect(reason)}",
+                  completed_now
+                )
 
               state
               |> Map.put(:completed_sessions, completed_sessions)
@@ -216,9 +230,11 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
           |> apply_codex_effective_model(update)
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
+          |> maybe_enforce_token_budget(issue_id)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -539,6 +555,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminate_task(_pid), do: :ok
 
   defp choose_issues(issues, state) do
+    state = prune_budget_state(state)
     active_states = active_state_set()
     terminal_states = terminal_state_set()
     paused_states = paused_state_set()
@@ -584,6 +601,7 @@ defmodule SymphonyElixir.Orchestrator do
     candidate_issue?(issue, active_states, terminal_states) and
       !paused_issue_state?(issue.state, paused_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !budget_issue_suppressed?(state, issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
@@ -749,11 +767,22 @@ defmodule SymphonyElixir.Orchestrator do
             codex_input_tokens: 0,
             codex_output_tokens: 0,
             codex_total_tokens: 0,
+            current_turn_input_baseline: 0,
+            current_turn_output_baseline: 0,
+            current_turn_total_baseline: 0,
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
             stdout_line_count: 0,
             turn_count: 0,
+            budget_current_turn_tokens: 0,
+            budget_current_run_tokens: 0,
+            budget_issue_window_tokens: 0,
+            budget_soft_limits: [],
+            budget_hard_limit: nil,
+            budget_continuation_blocked: false,
+            budget_suppressed: false,
+            budget_stop_reason: nil,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
           })
@@ -936,27 +965,63 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp maybe_cleanup_orphaned_task_workers(orchestrator_name) when orchestrator_name == __MODULE__ do
+    case Process.whereis(SymphonyElixir.TaskSupervisor) do
+      pid when is_pid(pid) ->
+        SymphonyElixir.TaskSupervisor
+        |> Task.Supervisor.children()
+        |> Enum.each(fn worker_pid ->
+          Logger.warning("Stopping orphaned task worker at startup pid=#{inspect(worker_pid)}")
+          terminate_task(worker_pid)
+        end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp maybe_cleanup_orphaned_task_workers(_orchestrator_name), do: :ok
+
   defp notify_dashboard do
     StatusDashboard.notify_update()
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set(), paused_state_set()) and
-         dispatch_slots_available?(issue, state) do
-      {:noreply, dispatch_issue(state, issue, attempt)}
-    else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+    state = prune_budget_state(state)
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+    cond do
+      budget_issue_suppressed?(state, issue.id) ->
+        Logger.warning("Issue is budget-suppressed: #{issue_context(issue)}")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "token budget suppression active",
+             delay_type: :continuation
+           })
+         )}
+
+      retry_candidate_issue?(issue, terminal_state_set(), paused_state_set()) and
+          dispatch_slots_available?(issue, state) ->
+        {:noreply, dispatch_issue(state, issue, attempt)}
+
+      true ->
+        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "no available orchestrator slots"
+           })
+         )}
     end
   end
 
@@ -965,8 +1030,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
+    if metadata[:delay_type] in [:continuation, :budget_suppressed] and attempt == 1 do
+      Config.continuation_retry_ms()
     else
       failure_retry_delay(attempt)
     end
@@ -1068,6 +1133,8 @@ defmodule SymphonyElixir.Orchestrator do
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
 
+    state = prune_budget_state(state)
+
     running =
       state.running
       |> Enum.map(fn {issue_id, metadata} ->
@@ -1081,6 +1148,14 @@ defmodule SymphonyElixir.Orchestrator do
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
           turn_count: Map.get(metadata, :turn_count, 0),
+          budget_current_turn_tokens: Map.get(metadata, :budget_current_turn_tokens, 0),
+          budget_current_run_tokens: Map.get(metadata, :budget_current_run_tokens, 0),
+          budget_issue_window_tokens: Map.get(metadata, :budget_issue_window_tokens, 0),
+          budget_soft_limits: Map.get(metadata, :budget_soft_limits, []),
+          budget_hard_limit: Map.get(metadata, :budget_hard_limit),
+          budget_continuation_blocked: Map.get(metadata, :budget_continuation_blocked, false),
+          budget_suppressed: Map.get(metadata, :budget_suppressed, false),
+          budget_stop_reason: Map.get(metadata, :budget_stop_reason),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
@@ -1108,8 +1183,7 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
-    {:reply,
-     snapshot_payload(state, running, retrying, now_ms), state}
+    {:reply, snapshot_payload(state, running, retrying, now_ms), state}
   end
 
   def handle_call(:reset_stats, _from, state) do
@@ -1119,6 +1193,8 @@ defmodule SymphonyElixir.Orchestrator do
     state = %{
       state
       | codex_totals: @empty_codex_totals,
+        budget_events: [],
+        suppressed_issues: %{},
         total_completed: 0,
         total_failed: 0,
         completed_sessions: []
@@ -1159,6 +1235,7 @@ defmodule SymphonyElixir.Orchestrator do
       running: running,
       retrying: retrying,
       codex_totals: state.codex_totals,
+      token_budget: token_budget_snapshot(state),
       rate_limits: selected_rate_limits,
       rate_limit_buckets: rate_limit_buckets,
       requested_model: requested_model,
@@ -1200,7 +1277,7 @@ defmodule SymphonyElixir.Orchestrator do
     turn_count = Map.get(running_entry, :turn_count, 0)
     {stdout_line_count, stdout_buffer} = append_stdout_to_file(running_entry, update)
 
-    {
+    updated_running_entry =
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
@@ -1216,9 +1293,10 @@ defmodule SymphonyElixir.Orchestrator do
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update),
         stdout_line_count: stdout_line_count,
         stdout_buffer: stdout_buffer
-      }),
-      token_delta
-    }
+      })
+      |> maybe_reset_turn_budget_baselines(event)
+
+    {updated_running_entry, token_delta}
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
@@ -1256,6 +1334,22 @@ defmodule SymphonyElixir.Orchestrator do
        do: existing_count
 
   defp turn_count_for_update(_existing_count, _existing_session_id, _update), do: 0
+
+  defp maybe_reset_turn_budget_baselines(
+         %{
+           codex_input_tokens: input_tokens,
+           codex_output_tokens: output_tokens,
+           codex_total_tokens: total_tokens
+         } = running_entry,
+         :session_started
+       ) do
+    running_entry
+    |> Map.put(:current_turn_input_baseline, input_tokens)
+    |> Map.put(:current_turn_output_baseline, output_tokens)
+    |> Map.put(:current_turn_total_baseline, total_tokens)
+  end
+
+  defp maybe_reset_turn_budget_baselines(running_entry, _event), do: running_entry
 
   defp summarize_codex_update(update) do
     %{
@@ -1381,6 +1475,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp get_nested(map, [key | rest]) when is_map(map) do
     value = Map.get(map, key) || Map.get(map, String.to_existing_atom(key))
+
     case rest do
       [] -> value
       _ when is_map(value) -> get_nested(value, rest)
@@ -1535,7 +1630,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_effective_model(%State{} = state, update) when is_map(update) do
     case extract_effective_model(update) do
-      nil -> state
+      nil ->
+        state
+
       model ->
         Logger.info("codex_effective_model set to #{inspect(model)}")
         %{state | codex_effective_model: model}
@@ -1862,9 +1959,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp rate_limit_bucket_model(rate_limits) when is_map(rate_limits) do
-    model_identifier_from_payload(
-      map_value(rate_limits, ["limit_name", :limit_name, "limitName", :limitName])
-    )
+    model_identifier_from_payload(map_value(rate_limits, ["limit_name", :limit_name, "limitName", :limitName]))
   end
 
   defp rate_limit_bucket_model(_rate_limits), do: nil
@@ -2000,7 +2095,8 @@ defmodule SymphonyElixir.Orchestrator do
                  String.contains?(normalized_model, normalized_value) ||
                  String.contains?(normalized_value, normalized_model))
 
-          _value -> false
+          _value ->
+            false
         end
       )
   end
@@ -2278,6 +2374,320 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp integer_like(_value), do: nil
 
+  defp maybe_schedule_continuation_retry(state, issue_id, running_entry) do
+    if Map.get(running_entry, :budget_continuation_blocked, false) or
+         budget_issue_suppressed?(state, issue_id) do
+      Logger.warning("Skipping continuation retry for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} due to token budget")
+
+      state
+    else
+      schedule_issue_retry(state, issue_id, 1, %{
+        identifier: running_entry.identifier,
+        delay_type: :continuation
+      })
+    end
+  end
+
+  defp maybe_enforce_token_budget(state, issue_id) when not is_binary(issue_id), do: state
+
+  defp maybe_enforce_token_budget(%State{} = state, issue_id) do
+    settings = Config.token_budget_settings()
+
+    if settings.enabled do
+      case Map.get(state.running, issue_id) do
+        nil ->
+          state
+
+        running_entry ->
+          evaluation = evaluate_token_budget(state, issue_id, running_entry, settings)
+
+          running_entry =
+            Map.merge(running_entry, %{
+              budget_current_turn_tokens: evaluation.current_turn_tokens,
+              budget_current_run_tokens: evaluation.current_run_tokens,
+              budget_issue_window_tokens: evaluation.rolling_issue_window_tokens,
+              budget_soft_limits: evaluation.soft_limits,
+              budget_hard_limit: evaluation.hard_limit,
+              budget_continuation_blocked: evaluation.continuation_blocked,
+              budget_suppressed: evaluation.suppressed,
+              budget_stop_reason: evaluation.stop_reason
+            })
+
+          state = %{state | running: Map.put(state.running, issue_id, running_entry)}
+
+          case evaluation.hard_limit do
+            nil ->
+              maybe_apply_budget_suppression(state, issue_id, running_entry, evaluation)
+
+            _hard_limit ->
+              force_stop_issue_for_budget(state, issue_id, running_entry, evaluation)
+          end
+      end
+    else
+      state
+    end
+  end
+
+  defp evaluate_token_budget(state, issue_id, running_entry, settings) do
+    current_turn_tokens =
+      max(
+        0,
+        Map.get(running_entry, :codex_total_tokens, 0) - Map.get(running_entry, :current_turn_total_baseline, 0)
+      )
+
+    current_run_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    rolling_issue_window_tokens = current_run_tokens + rolling_issue_window_tokens(state, issue_id)
+
+    soft_limits =
+      []
+      |> maybe_add_budget_limit(current_turn_tokens >= settings.per_turn_soft_tokens, :per_turn_soft_limit)
+      |> maybe_add_budget_limit(current_run_tokens >= settings.per_run_soft_tokens, :per_run_soft_limit)
+      |> maybe_add_budget_limit(
+        rolling_issue_window_tokens >= settings.per_issue_window_soft_tokens,
+        :per_issue_window_soft_limit
+      )
+
+    hard_limit =
+      cond do
+        current_turn_tokens >= settings.per_turn_hard_tokens -> :per_turn_hard_limit
+        current_run_tokens >= settings.per_run_hard_tokens -> :per_run_hard_limit
+        rolling_issue_window_tokens >= settings.per_issue_window_hard_tokens -> :per_issue_window_hard_limit
+        true -> nil
+      end
+
+    %{
+      current_turn_tokens: current_turn_tokens,
+      current_run_tokens: current_run_tokens,
+      rolling_issue_window_tokens: rolling_issue_window_tokens,
+      soft_limits: soft_limits,
+      hard_limit: hard_limit,
+      continuation_blocked:
+        :per_run_soft_limit in soft_limits or
+          :per_issue_window_soft_limit in soft_limits or
+          not is_nil(hard_limit),
+      suppressed:
+        :per_issue_window_soft_limit in soft_limits or
+          not is_nil(hard_limit),
+      stop_reason: hard_limit && Atom.to_string(hard_limit)
+    }
+  end
+
+  defp maybe_add_budget_limit(limits, true, limit), do: [limit | limits]
+  defp maybe_add_budget_limit(limits, false, _limit), do: limits
+
+  defp maybe_apply_budget_suppression(state, issue_id, running_entry, evaluation) do
+    if :per_issue_window_soft_limit in evaluation.soft_limits do
+      put_budget_suppression(state, issue_id, running_entry, %{
+        reason: "per_issue_window_soft_limit",
+        threshold_tokens: Config.token_budget_settings().per_issue_window_soft_tokens,
+        enforced_at: DateTime.utc_now()
+      })
+    else
+      state
+    end
+  end
+
+  defp force_stop_issue_for_budget(state, issue_id, running_entry, evaluation) do
+    state =
+      state
+      |> put_budget_suppression(issue_id, running_entry, %{
+        reason: evaluation.stop_reason,
+        threshold_tokens: release_threshold_for_budget_hard_limit(evaluation.hard_limit),
+        enforced_at: DateTime.utc_now()
+      })
+      |> record_budget_hard_stop(issue_id, running_entry, evaluation)
+
+    maybe_handle_over_budget_issue(running_entry, evaluation)
+    state
+  end
+
+  defp record_budget_hard_stop(state, issue_id, running_entry, evaluation) do
+    completed_now = DateTime.utc_now()
+    session_id = running_entry_session_id(running_entry)
+
+    record = %{
+      identifier: running_entry.identifier,
+      issue_id: issue_id,
+      session_id: session_id,
+      started_at: running_entry.started_at,
+      completed_at: completed_now,
+      runtime_seconds: running_seconds(running_entry.started_at, completed_now),
+      input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      outcome: :failure,
+      error: "token budget exceeded: #{evaluation.stop_reason}"
+    }
+
+    if is_pid(running_entry.pid) do
+      terminate_task(running_entry.pid)
+    end
+
+    if is_reference(running_entry.ref) do
+      Process.demonitor(running_entry.ref, [:flush])
+    end
+
+    state
+    |> record_session_completion_totals(running_entry)
+    |> record_budget_event(running_entry, :failure, evaluation.stop_reason, completed_now)
+    |> Map.put(:completed_sessions, Enum.take([record | state.completed_sessions], 50))
+    |> Map.update!(:total_failed, &(&1 + 1))
+    |> Map.put(:running, Map.delete(state.running, issue_id))
+    |> Map.put(:claimed, MapSet.delete(state.claimed, issue_id))
+    |> Map.put(:retry_attempts, Map.delete(state.retry_attempts, issue_id))
+  end
+
+  defp maybe_handle_over_budget_issue(running_entry, evaluation) when is_map(running_entry) do
+    settings = Config.token_budget_settings()
+    comment_body = format_budget_comment(running_entry, evaluation, settings)
+
+    if settings.comment_on_enforcement do
+      case Tracker.create_comment(running_entry.issue.id, comment_body) do
+        :ok -> :ok
+        {:error, reason} -> Logger.warning("Failed to comment on over-budget issue #{running_entry.identifier}: #{inspect(reason)}")
+      end
+    end
+
+    if settings.pause_on_hard_limit do
+      case List.first(Config.linear_paused_states()) do
+        state_name when is_binary(state_name) and state_name != "" ->
+          case Tracker.update_issue_state(running_entry.issue.id, state_name) do
+            :ok -> :ok
+            {:error, reason} -> Logger.warning("Failed to pause over-budget issue #{running_entry.identifier}: #{inspect(reason)}")
+          end
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp maybe_handle_over_budget_issue(_running_entry, _evaluation), do: :ok
+
+  defp format_budget_comment(_running_entry, evaluation, settings) do
+    """
+    Symphony stopped this run because it exceeded the configured token budget.
+
+    - Limit: `#{evaluation.stop_reason}`
+    - Current run tokens: `#{evaluation.current_run_tokens}`
+    - Current turn tokens: `#{evaluation.current_turn_tokens}`
+    - Rolling issue-window tokens (#{settings.issue_window_seconds}s): `#{evaluation.rolling_issue_window_tokens}`
+    - Action: stopped the worker#{if settings.pause_on_hard_limit, do: " and moved the issue to a paused state when available", else: ""}
+    """
+    |> String.trim()
+  end
+
+  defp put_budget_suppression(state, issue_id, running_entry, attributes) do
+    suppression =
+      attributes
+      |> Map.put(:issue_id, issue_id)
+      |> Map.put(:identifier, running_entry.identifier)
+
+    %{state | suppressed_issues: Map.put(Map.get(state, :suppressed_issues, %{}), issue_id, suppression)}
+  end
+
+  defp release_threshold_for_budget_hard_limit(:per_turn_hard_limit),
+    do: Config.token_budget_settings().per_turn_hard_tokens
+
+  defp release_threshold_for_budget_hard_limit(:per_run_hard_limit),
+    do: Config.token_budget_settings().per_run_hard_tokens
+
+  defp release_threshold_for_budget_hard_limit(:per_issue_window_hard_limit),
+    do: Config.token_budget_settings().per_issue_window_hard_tokens
+
+  defp release_threshold_for_budget_hard_limit(_),
+    do: Config.token_budget_settings().per_issue_window_hard_tokens
+
+  defp budget_issue_suppressed?(state, issue_id) when is_binary(issue_id) do
+    Map.has_key?(Map.get(state, :suppressed_issues, %{}), issue_id)
+  end
+
+  defp budget_issue_suppressed?(_state, _issue_id), do: false
+
+  defp rolling_issue_window_tokens(state, issue_id) when is_binary(issue_id) do
+    state
+    |> Map.get(:budget_events, [])
+    |> Enum.reduce(0, fn event, acc ->
+      if Map.get(event, :issue_id) == issue_id do
+        acc + Map.get(event, :total_tokens, 0)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp rolling_issue_window_tokens(_state, _issue_id), do: 0
+
+  defp record_budget_event(state, running_entry, outcome, stop_reason, completed_at) do
+    event = %{
+      issue_id: Map.get(running_entry.issue, :id),
+      identifier: Map.get(running_entry, :identifier),
+      session_id: running_entry_session_id(running_entry),
+      completed_at: completed_at,
+      input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      outcome: outcome,
+      stop_reason: stop_reason
+    }
+
+    %{state | budget_events: prune_budget_events([event | Map.get(state, :budget_events, [])])}
+  end
+
+  defp prune_budget_state(%State{} = state) do
+    budget_events = prune_budget_events(Map.get(state, :budget_events, []))
+
+    suppressed_issues =
+      state
+      |> Map.get(:suppressed_issues, %{})
+      |> Enum.reduce(%{}, fn {issue_id, suppression}, acc ->
+        if rolling_issue_window_tokens(%{state | budget_events: budget_events}, issue_id) >=
+             Map.get(suppression, :threshold_tokens, 0) do
+          Map.put(acc, issue_id, suppression)
+        else
+          acc
+        end
+      end)
+
+    %{state | budget_events: budget_events, suppressed_issues: suppressed_issues}
+  end
+
+  defp prune_budget_events(events) when is_list(events) do
+    cutoff = DateTime.add(DateTime.utc_now(), -Config.token_budget_settings().issue_window_seconds, :second)
+
+    Enum.filter(events, fn
+      %{completed_at: %DateTime{} = completed_at} ->
+        DateTime.compare(completed_at, cutoff) != :lt
+
+      _ ->
+        false
+    end)
+  end
+
+  defp prune_budget_events(_events), do: []
+
+  defp token_budget_snapshot(state) do
+    settings = Config.token_budget_settings()
+
+    %{
+      enabled: settings.enabled,
+      issue_window_seconds: settings.issue_window_seconds,
+      suppressed_issues:
+        Map.get(state, :suppressed_issues, %{})
+        |> Map.values()
+        |> Enum.map(fn suppression ->
+          %{
+            issue_id: Map.get(suppression, :issue_id),
+            identifier: Map.get(suppression, :identifier),
+            reason: Map.get(suppression, :reason),
+            threshold_tokens: Map.get(suppression, :threshold_tokens),
+            enforced_at: Map.get(suppression, :enforced_at)
+          }
+        end)
+    }
+  end
+
   # ── Stats persistence ──────────────────────────────────────────────
 
   @impl true
@@ -2309,9 +2719,17 @@ defmodule SymphonyElixir.Orchestrator do
           |> Enum.take(50)
           |> Enum.map(&restore_session_record/1)
 
+        budget_events =
+          persisted
+          |> Map.get("budget_events", [])
+          |> Enum.map(&restore_budget_event/1)
+          |> Enum.reject(&is_nil/1)
+          |> prune_budget_events()
+
         %{
           state
           | codex_totals: codex_totals,
+            budget_events: budget_events,
             total_completed: Map.get(persisted, "total_completed", 0),
             total_failed: Map.get(persisted, "total_failed", 0),
             completed_sessions: completed_sessions
@@ -2341,6 +2759,22 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp restore_session_record(_record), do: nil
 
+  defp restore_budget_event(record) when is_map(record) do
+    %{
+      issue_id: Map.get(record, "issue_id"),
+      identifier: Map.get(record, "identifier"),
+      session_id: Map.get(record, "session_id"),
+      completed_at: parse_persisted_datetime(Map.get(record, "completed_at")),
+      input_tokens: Map.get(record, "input_tokens", 0),
+      output_tokens: Map.get(record, "output_tokens", 0),
+      total_tokens: Map.get(record, "total_tokens", 0),
+      outcome: restore_outcome(Map.get(record, "outcome")),
+      stop_reason: Map.get(record, "stop_reason")
+    }
+  end
+
+  defp restore_budget_event(_record), do: nil
+
   defp restore_outcome("success"), do: :success
   defp restore_outcome("failure"), do: :failure
   defp restore_outcome(_), do: :unknown
@@ -2354,17 +2788,43 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp parse_persisted_datetime(_), do: nil
 
-  defp flush_stats_to_disk(state) do
-    tool_stats = BeamIntrospector.tool_execution_stats()
+  @doc false
+  def flush_stats_to_disk_for_test(state, tool_stats_fun) when is_function(tool_stats_fun, 0) do
+    persist_stats_to_disk(state, tool_stats_fun)
+  end
 
+  defp flush_stats_to_disk(state), do: persist_stats_to_disk(state, &BeamIntrospector.tool_execution_stats/0)
+
+  defp persist_stats_to_disk(state, tool_stats_fun) do
     StatsPersistence.save(%{
-      codex_totals: state.codex_totals,
-      total_completed: state.total_completed,
-      total_failed: state.total_failed,
-      completed_sessions: Enum.take(state.completed_sessions, 50),
-      tool_stats: tool_stats,
+      codex_totals: Map.get(state, :codex_totals, @empty_codex_totals),
+      total_completed: Map.get(state, :total_completed, 0),
+      total_failed: Map.get(state, :total_failed, 0),
+      completed_sessions: state |> Map.get(:completed_sessions, []) |> Enum.take(50),
+      budget_events: Map.get(state, :budget_events, []),
+      tool_stats: safe_tool_stats(tool_stats_fun),
       persisted_at: DateTime.utc_now() |> DateTime.to_iso8601()
     })
+  end
+
+  defp safe_tool_stats(tool_stats_fun) when is_function(tool_stats_fun, 0) do
+    tool_stats_fun.()
+    |> case do
+      stats when is_list(stats) ->
+        stats
+
+      other ->
+        Logger.warning("Skipping non-list tool stats payload: #{inspect(other)}")
+        []
+    end
+  rescue
+    error ->
+      Logger.warning("Skipping tool stats flush due to error: #{Exception.message(error)}")
+      []
+  catch
+    kind, reason ->
+      Logger.warning("Skipping tool stats flush due to #{kind}: #{inspect(reason)}")
+      []
   end
 
   defp schedule_stats_flush do

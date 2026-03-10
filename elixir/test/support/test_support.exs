@@ -31,9 +31,11 @@ defmodule SymphonyElixir.TestSupport do
             "symphony-elixir-workflow-#{System.unique_integer([:positive])}"
           )
 
+        workspace_root = Path.join(workflow_root, "workspaces")
+
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
-        write_workflow_file!(workflow_file)
+        write_workflow_file!(workflow_file, workspace_root: workspace_root)
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
@@ -105,6 +107,19 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
+          continuation_retry_ms: 60_000,
+          token_budget: %{
+            enabled: true,
+            per_turn_soft_tokens: 150_000,
+            per_turn_hard_tokens: 250_000,
+            per_run_soft_tokens: 400_000,
+            per_run_hard_tokens: 600_000,
+            per_issue_window_soft_tokens: 1_000_000,
+            per_issue_window_hard_tokens: 1_500_000,
+            issue_window_seconds: 86_400,
+            comment_on_enforcement: true,
+            pause_on_hard_limit: true
+          },
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
@@ -141,6 +156,8 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
+    continuation_retry_ms = Keyword.get(config, :continuation_retry_ms)
+    token_budget = Keyword.get(config, :token_budget)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
@@ -181,6 +198,8 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
+        "  continuation_retry_ms: #{yaml_value(continuation_retry_ms)}",
+        "  token_budget: #{yaml_value(token_budget)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",

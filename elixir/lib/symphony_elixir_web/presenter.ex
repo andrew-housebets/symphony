@@ -20,6 +20,7 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
+          token_budget: Map.get(snapshot, :token_budget, %{}),
           rate_limits: snapshot.rate_limits,
           rate_limit_buckets: Enum.map(Map.get(snapshot, :rate_limit_buckets, []), &rate_limit_bucket_payload/1),
           requested_model: Map.get(snapshot, :requested_model),
@@ -120,6 +121,16 @@ defmodule SymphonyElixirWeb.Presenter do
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
       },
+      token_budget: %{
+        current_turn_tokens: Map.get(entry, :budget_current_turn_tokens, 0),
+        current_run_tokens: Map.get(entry, :budget_current_run_tokens, 0),
+        issue_window_tokens: Map.get(entry, :budget_issue_window_tokens, 0),
+        soft_limits: Map.get(entry, :budget_soft_limits, []),
+        hard_limit: Map.get(entry, :budget_hard_limit),
+        continuation_blocked: Map.get(entry, :budget_continuation_blocked, false),
+        suppressed: Map.get(entry, :budget_suppressed, false),
+        stop_reason: Map.get(entry, :budget_stop_reason)
+      },
       process_memory: Map.get(entry, :process_memory, 0)
     }
   end
@@ -159,6 +170,16 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
+      },
+      token_budget: %{
+        current_turn_tokens: Map.get(running, :budget_current_turn_tokens, 0),
+        current_run_tokens: Map.get(running, :budget_current_run_tokens, 0),
+        issue_window_tokens: Map.get(running, :budget_issue_window_tokens, 0),
+        soft_limits: Map.get(running, :budget_soft_limits, []),
+        hard_limit: Map.get(running, :budget_hard_limit),
+        continuation_blocked: Map.get(running, :budget_continuation_blocked, false),
+        suppressed: Map.get(running, :budget_suppressed, false),
+        stop_reason: Map.get(running, :budget_stop_reason)
       }
     }
   end

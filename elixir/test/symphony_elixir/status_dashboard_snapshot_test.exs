@@ -5,6 +5,22 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
 
   @terminal_columns 115
 
+  setup do
+    previous_now = Application.get_env(:symphony_elixir, :status_dashboard_now)
+
+    Application.put_env(:symphony_elixir, :status_dashboard_now, ~U[2026-03-10 22:06:20Z])
+
+    on_exit(fn ->
+      if is_nil(previous_now) do
+        Application.delete_env(:symphony_elixir, :status_dashboard_now)
+      else
+        Application.put_env(:symphony_elixir, :status_dashboard_now, previous_now)
+      end
+    end)
+
+    :ok
+  end
+
   test "snapshot fixture: idle dashboard" do
     snapshot_data =
       {:ok,

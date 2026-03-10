@@ -100,25 +100,34 @@ defmodule SymphonyElixir.BeamIntrospector do
   def tool_execution_stats do
     if :ets.whereis(@tool_stats_table) != :undefined do
       :ets.tab2list(@tool_stats_table)
-      |> Enum.flat_map(fn
-        {tool_name, count, total_us, last_us} when is_binary(tool_name) ->
-          avg_ms = if count > 0, do: Float.round(total_us / count / 1_000, 1), else: 0.0
-
-          [%{
-            tool: tool_name,
-            call_count: count,
-            avg_ms: avg_ms,
-            last_ms: Float.round(last_us / 1_000, 1),
-            total_ms: Float.round(total_us / 1_000, 1)
-          }]
-
-        _other ->
-          []
+      |> Enum.reduce([], fn row, acc ->
+        case normalize_tool_stat_row(row) do
+          {:ok, stat} -> [stat | acc]
+          :skip -> acc
+        end
       end)
+      |> Enum.reverse()
     else
       []
     end
   end
+
+  defp normalize_tool_stat_row({tool_name, count, total_us, last_us})
+       when is_binary(tool_name) and is_integer(count) and count >= 0 and is_integer(total_us) and total_us >= 0 and
+              is_integer(last_us) and last_us >= 0 do
+    avg_ms = if count > 0, do: Float.round(total_us / count / 1_000, 1), else: 0.0
+
+    {:ok,
+     %{
+       tool: tool_name,
+       call_count: count,
+       avg_ms: avg_ms,
+       last_ms: Float.round(last_us / 1_000, 1),
+       total_ms: Float.round(total_us / 1_000, 1)
+     }}
+  end
+
+  defp normalize_tool_stat_row(_row), do: :skip
 
   @spec atom_table() :: map()
   def atom_table do

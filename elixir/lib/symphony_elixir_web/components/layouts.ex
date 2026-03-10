@@ -5,9 +5,14 @@ defmodule SymphonyElixirWeb.Layouts do
 
   use Phoenix.Component
 
+  alias SymphonyElixirWeb.StaticAssets
+
   @spec root(map()) :: Phoenix.LiveView.Rendered.t()
   def root(assigns) do
-    assigns = assign(assigns, :csrf_token, Plug.CSRFProtection.get_csrf_token())
+    assigns =
+      assigns
+      |> assign(:csrf_token, Plug.CSRFProtection.get_csrf_token())
+      |> assign(:asset_version, StaticAssets.version())
 
     ~H"""
     <!DOCTYPE html>
@@ -17,9 +22,9 @@ defmodule SymphonyElixirWeb.Layouts do
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="csrf-token" content={@csrf_token} />
         <title>Symphony Observability</title>
-        <script defer src="/vendor/phoenix_html/phoenix_html.js"></script>
-        <script defer src="/vendor/phoenix/phoenix.js"></script>
-        <script defer src="/vendor/phoenix_live_view/phoenix_live_view.js"></script>
+        <script defer src={versioned_asset_path("/vendor/phoenix_html/phoenix_html.js", @asset_version)}></script>
+        <script defer src={versioned_asset_path("/vendor/phoenix/phoenix.js", @asset_version)}></script>
+        <script defer src={versioned_asset_path("/vendor/phoenix_live_view/phoenix_live_view.js", @asset_version)}></script>
         <script>
           window.addEventListener("DOMContentLoaded", function () {
             var csrfToken = document
@@ -36,7 +41,7 @@ defmodule SymphonyElixirWeb.Layouts do
             window.liveSocket = liveSocket;
           });
         </script>
-        <link rel="stylesheet" href="/dashboard.css" />
+        <link rel="stylesheet" href={versioned_asset_path("/dashboard.css", @asset_version)} />
       </head>
       <body>
         {@inner_content}
@@ -52,5 +57,9 @@ defmodule SymphonyElixirWeb.Layouts do
       {@inner_content}
     </main>
     """
+  end
+
+  defp versioned_asset_path(path, version) when is_binary(path) and is_binary(version) do
+    "#{path}?v=#{version}"
   end
 end

@@ -560,6 +560,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "/vendor/phoenix_html/phoenix_html.js"
     assert html =~ "/vendor/phoenix/phoenix.js"
     assert html =~ "/vendor/phoenix_live_view/phoenix_live_view.js"
+    assert html =~ ~r/\/dashboard\.css\?v=[0-9a-f]{12}/
+    assert html =~ ~r/\/vendor\/phoenix_html\/phoenix_html\.js\?v=[0-9a-f]{12}/
+    assert html =~ ~r/\/vendor\/phoenix\/phoenix\.js\?v=[0-9a-f]{12}/
+    assert html =~ ~r/\/vendor\/phoenix_live_view\/phoenix_live_view\.js\?v=[0-9a-f]{12}/
     refute html =~ "/assets/app.js"
     refute html =~ "<style>"
 

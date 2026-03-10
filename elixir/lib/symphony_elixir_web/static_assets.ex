@@ -15,6 +15,8 @@ defmodule SymphonyElixirWeb.StaticAssets do
   @phoenix_html_js File.read!(@phoenix_html_js_path)
   @phoenix_js File.read!(@phoenix_js_path)
   @phoenix_live_view_js File.read!(@phoenix_live_view_js_path)
+  @version_source @dashboard_css <> @phoenix_html_js <> @phoenix_js <> @phoenix_live_view_js
+  @version :crypto.hash(:sha256, @version_source) |> Base.encode16(case: :lower) |> binary_part(0, 12)
 
   @assets %{
     "/dashboard.css" => {"text/css", @dashboard_css},
@@ -30,4 +32,7 @@ defmodule SymphonyElixirWeb.StaticAssets do
       :error -> :error
     end
   end
+
+  @spec version() :: String.t()
+  def version, do: @version
 end

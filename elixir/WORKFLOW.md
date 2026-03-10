@@ -6,6 +6,7 @@ tracker:
     - Todo
     - In Progress
     - Rework
+    - Resolve PR Comments
     - Human Review
     - Merging
   paused_states:
@@ -116,11 +117,12 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 
 - `Backlog` -> out of scope for this workflow; do not modify.
 - `Todo` -> queued; ensure branch policy/alignment first, then transition to `In Progress` before active work.
-  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
+  - Special case: if a PR is already attached, treat as feedback loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
+- `Resolve PR Comments` -> human-triggered feedback pass; address outstanding PR comments/reviews, revalidate, and return to `Human Review`.
+- `Human Review` -> PR is attached and validated; waiting on human action (`Resolve PR Comments` for changes or `Merging` for approval).
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
-- `Rework` -> reviewer requested changes; planning + implementation required.
+- `Rework` -> full reset path only (close prior PR, restart from fresh branch/workpad).
 - `Done` -> terminal state; no further action required.
 
 ## Step 0: Determine current ticket state and route
@@ -132,9 +134,10 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` -> wait and poll for decision/review updates.
+   - `Resolve PR Comments` -> run PR feedback resolution loop, then return to `Human Review` once clear.
+   - `Human Review` -> wait and poll for decision/review updates; do not change state from `Human Review`.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
-   - `Rework` -> run rework flow.
+   - `Rework` -> run full reset rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
@@ -227,7 +230,7 @@ Use this only when completion is blocked by missing required tools or missing au
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
-## Step 2: Execution phase (Todo -> In Progress -> Human Review)
+## Step 2: Execution phase (Todo -> In Progress -> Resolve PR Comments -> Human Review)
 
 1. Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
    - If `git branch --show-current` does not match Linear `issue.branchName`, stop and fix branch alignment first.
@@ -275,14 +278,16 @@ Use this only when completion is blocked by missing required tools or missing au
     - Ensure branch was pushed with any required updates.
     - Then apply the same `Human Review entry gate (hard requirement)` before any state transition.
 
-## Step 3: Human Review and merge handling
+## Step 3: Human Review, PR comments, and merge handling
 
 1. When the issue is in `Human Review`, do not code or change ticket content.
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
-3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
-4. If approved, human moves the issue to `Merging`.
-5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-6. After merge is complete, move the issue to `Done`.
+3. If review feedback requires changes while in `Human Review`, do not change state; wait for a human to move the issue to `Resolve PR Comments`.
+4. In `Resolve PR Comments`, address only outstanding PR feedback (code updates or explicit justified pushback replies), rerun required validation, and run the full PR feedback sweep until clear.
+5. After `Resolve PR Comments` work is complete and the `Human Review entry gate (hard requirement)` is satisfied, move the issue back to `Human Review`.
+6. If approved, human moves the issue to `Merging`.
+7. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
+8. After merge is complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
 
@@ -312,6 +317,9 @@ Use this only when completion is blocked by missing required tools or missing au
 - If the branch PR is already closed/merged, do not reuse that branch or prior implementation state for continuation.
 - For closed/merged branch PRs, create a new branch from `origin/main` and restart from reproduction/planning as if starting fresh.
 - If issue state is `Backlog`, do not modify it; wait for human to move to `Todo`.
+- Do not move issues out of `Human Review`; humans control transitions from `Human Review`.
+- Do not move `Human Review` tickets to `Rework` for normal PR feedback; use `Resolve PR Comments` instead.
+- Use `Rework` only when a full reset is explicitly required (fresh branch + fresh workpad path).
 - Do not edit the issue body/description for planning or progress tracking.
 - Use exactly one persistent workpad comment (`## Codex Workpad`) per issue.
 - If comment editing is unavailable in-session, use the update script. Only report blocked if both MCP editing and script-based editing are unavailable.

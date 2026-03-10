@@ -435,6 +435,43 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
   end
 
+  test "linear_graphql blocks direct Human Review to Rework transitions" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => issue_state_update_query(),
+          "variables" => %{"issueId" => "issue-123", "stateId" => "state-rework"}
+        },
+        linear_client: fn query, _variables, _opts ->
+          if query =~ "query SymphonyHumanReviewGateIssue" do
+            {:ok, human_review_gate_issue_response("Rework", "state-rework", "feat/issue-123", "Human Review")}
+          else
+            flunk("mutation should not run when transitioning Human Review directly to Rework")
+          end
+        end,
+        command_runner: fn _command, _args, _opts ->
+          flunk("GitHub checks should not run when transition gate fails")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert [
+             %{
+               "text" => text
+             }
+           ] = response["contentItems"]
+
+    assert %{
+             "error" => %{
+               "message" => message
+             }
+           } = Jason.decode!(text)
+
+    assert message =~ "Human Review to Rework"
+  end
+
   test "linear_graphql blocks In Progress transition when branch name is missing" do
     response =
       DynamicTool.execute(
@@ -749,13 +786,15 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   defp human_review_gate_issue_response(
          state_name,
          state_id \\ "state-human-review",
-         branch_name \\ "feat/issue-123"
+         branch_name \\ "feat/issue-123",
+         current_state_name \\ "In Progress"
        ) do
     %{
       "data" => %{
         "issue" => %{
           "id" => "issue-123",
           "identifier" => "SYM-123",
+          "state" => %{"name" => current_state_name},
           "branchName" => branch_name,
           "team" => %{
             "states" => %{

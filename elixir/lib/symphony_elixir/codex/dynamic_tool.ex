@@ -7,7 +7,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @linear_graphql_tool "linear_graphql"
   @human_review_state "human review"
-  @branch_enforced_states MapSet.new(["in progress", "rework", "human review", "merging"])
+  @resolve_pr_comments_state "resolve pr comments"
+  @rework_state "rework"
+  @branch_enforced_states MapSet.new(["in progress", "rework", "resolve pr comments", "human review", "merging"])
   @conventional_branch_types ~w(build chore ci docs feat fix perf refactor revert style test)
   @conventional_branch_regex Regex.compile!("^(?:#{Enum.join(@conventional_branch_types, "|")})\\/[a-z0-9][a-z0-9._-]*$")
   @conventional_branch_prefixes Enum.map(@conventional_branch_types, &"#{&1}/")
@@ -16,6 +18,9 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     issue(id: $issueId) {
       id
       identifier
+      state {
+        name
+      }
       branchName
       team {
         states(first: 250) {
@@ -147,6 +152,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       {:ok, %{issue_id: issue_id, state_id: state_id}} ->
         with {:ok, issue_context} <- fetch_issue_context(issue_id, state_id, linear_client),
              {:ok, issue_context} <- enforce_branch_name_gate(issue_context, extract_transition_branch_name(query, variables)),
+             :ok <- enforce_rework_transition_gate(issue_context),
              :ok <- enforce_human_review_pr_gate(issue_context, command_runner, command_cwd) do
           :ok
         end
@@ -246,6 +252,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
        %{
          issue_id: issue_id,
          identifier: map_path(issue, ["identifier"]),
+         current_state_name: map_path(issue, ["state", "name"]),
          branch_name: map_path(issue, ["branchName"]),
          state_name: state_name
        }}
@@ -363,6 +370,24 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp branch_name_required_for_state?(_state_name), do: false
+
+  defp enforce_rework_transition_gate(issue_context) when is_map(issue_context) do
+    current_state = normalize_state_name(issue_context[:current_state_name])
+    target_state = normalize_state_name(issue_context[:state_name])
+
+    if current_state == @human_review_state and target_state == @rework_state do
+      gate_error(
+        "Cannot move directly from Human Review to Rework for review feedback. Move to Resolve PR Comments instead.",
+        %{
+          issue_id: issue_context[:issue_id],
+          identifier: issue_context[:identifier],
+          recommended_state: @resolve_pr_comments_state
+        }
+      )
+    else
+      :ok
+    end
+  end
 
   defp conventional_branch_name?(branch_name) when is_binary(branch_name) do
     branch_name

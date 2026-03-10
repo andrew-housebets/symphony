@@ -127,7 +127,8 @@ Exit codes:
 - If all jobs fail with corrupted pnpm lockfile errors on the merge commit, the
   remediation is to fetch latest `origin/main`, merge, force-push, and rerun CI.
 - If mergeability is `UNKNOWN`, wait and re-check.
-- Do not merge while review comments (human or Codex review) are outstanding.
+- Do not merge while any actionable review comments are outstanding, regardless
+  of author (human or bot, including Codex review comments).
 - Codex review jobs retry on failure and are non-blocking; use the presence of
   `## Codex Review — <persona>` issue comments (not job status) as the signal
   that review feedback is available.
@@ -143,8 +144,9 @@ Exit codes:
   start with `## Codex Review — <persona>` and include the reviewer’s
   methodology + guardrails used. Treat these as feedback that must be
   acknowledged before merge.
-- Human review comments are blocking and must be addressed (responded to and
-  resolved) before requesting a new review or merging.
+- Actionable review comments from any reviewer (human or bot) are blocking and
+  must be addressed (responded to and resolved) before requesting a new review
+  or merging.
 - If multiple reviewers comment in the same thread, respond to each comment
   (batching is fine) before closing the thread.
 - Fetch review comments via `gh api` and reply with a prefixed comment.
@@ -173,7 +175,7 @@ Exit codes:
   thread) with `[codex]` and state whether you will address the feedback now or
   defer it (include rationale).
 - If feedback requires changes:
-  - For inline review comments (human), reply with intended fixes
+  - For inline review comments (any reviewer), reply with intended fixes
     (`[codex] ...`) **as an inline reply to the original review comment** using
     the review comment endpoint and `in_reply_to` (do not use issue comments for
     this).

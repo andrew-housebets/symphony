@@ -270,15 +270,6 @@ def is_codex_bot_user(user: dict[str, Any]) -> bool:
     return login in CODEX_BOTS
 
 
-def is_bot_user(user: dict[str, Any]) -> bool:
-    login = user.get("login") or ""
-    if is_codex_bot_user(user):
-        return True
-    if user.get("type") == "Bot":
-        return True
-    return login.endswith("[bot]")
-
-
 def is_codex_reply_body(body: str) -> bool:
     return body.startswith("[codex]")
 
@@ -303,12 +294,10 @@ def latest_codex_issue_reply_time(
     return latest
 
 
-def filter_human_issue_comments(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_unaddressed_issue_comments(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest_ack = latest_codex_issue_reply_time(comments)
     filtered: list[dict[str, Any]] = []
     for comment in comments:
-        if is_bot_user(comment.get("user", {})):
-            continue
         body = (comment.get("body") or "").strip()
         if is_codex_reply_body(body):
             continue
@@ -376,14 +365,12 @@ def latest_codex_reply_by_thread(
     return latest
 
 
-def filter_human_review_comments(
+def filter_unaddressed_review_comments(
     comments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     latest_codex_reply = latest_codex_reply_by_thread(comments)
     filtered: list[dict[str, Any]] = []
     for comment in comments:
-        if is_bot_user(comment.get("user", {})):
-            continue
         body = (comment.get("body") or "").strip()
         if is_codex_reply_body(body):
             continue
@@ -415,8 +402,6 @@ def is_blocking_review(
         return False
     body = (review.get("body") or "").strip()
     state = review.get("state")
-    if user_login in CODEX_BOTS:
-        return state == "CHANGES_REQUESTED"
     if body.startswith("[codex]") or state in ("APPROVED", "DISMISSED"):
         return False
     blocking = False
@@ -485,16 +470,20 @@ async def fetch_review_context(
     return issue_comments, review_comments, reviews, review_request_at
 
 
-def raise_on_human_feedback(
+def raise_on_unaddressed_feedback(
     issue_comments: list[dict[str, Any]],
     review_comments: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
     review_request_at: datetime | None,
 ) -> None:
-    human_issue_comments = filter_human_issue_comments(issue_comments)
+    unaddressed_issue_comments = filter_unaddressed_issue_comments(issue_comments)
     codex_review_comments = filter_codex_review_issue_comments(issue_comments)
-    human_review_comments = filter_human_review_comments(review_comments)
-    if human_issue_comments or human_review_comments or codex_review_comments:
+    unaddressed_review_comments = filter_unaddressed_review_comments(review_comments)
+    if (
+        unaddressed_issue_comments
+        or unaddressed_review_comments
+        or codex_review_comments
+    ):
         print("Review comments detected. Address before merge.")
         print(
             "Reminder: decide whether feedback stays in scope; defer if needed "
@@ -523,7 +512,7 @@ async def wait_for_codex(pr_number: int, checks_done: asyncio.Event) -> None:
         bot_issue_comments = filter_codex_comments(issue_comments, review_request_at)
         bot_review_comments = filter_codex_comments(review_comments, review_request_at)
         bot_comments = bot_issue_comments + bot_review_comments
-        raise_on_human_feedback(
+        raise_on_unaddressed_feedback(
             issue_comments,
             review_comments,
             reviews,

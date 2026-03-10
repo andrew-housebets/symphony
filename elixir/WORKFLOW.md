@@ -111,7 +111,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `commit`: produce clean, logical commits during implementation.
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
-- `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
+- `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md` for squash-merge + workspace cleanup.
 
 ## Status map
 
@@ -121,7 +121,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `In Progress` -> implementation actively underway.
 - `Resolve PR Comments` -> human-triggered feedback pass; address outstanding PR comments/reviews, revalidate, and return to `Human Review`.
 - `Human Review` -> PR is attached and validated; waiting on human action (`Resolve PR Comments` for changes or `Merging` for approval).
-- `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
+- `Merging` -> approved by human; run `land` to squash-merge, clean workspace, then move to `Done`.
 - `Rework` -> full reset path only (close prior PR, restart from fresh branch/workpad).
 - `Done` -> terminal state; no further action required.
 
@@ -136,7 +136,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `In Progress` -> continue execution flow from current scratchpad comment.
    - `Resolve PR Comments` -> run PR feedback resolution loop, then return to `Human Review` once clear.
    - `Human Review` -> wait and poll for decision/review updates; do not change state from `Human Review`.
-   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
+   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; squash-merge, clean workspace, then move to `Done`.
    - `Rework` -> run full reset rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
@@ -286,8 +286,8 @@ Use this only when completion is blocked by missing required tools or missing au
 4. In `Resolve PR Comments`, address only outstanding PR feedback (code updates or explicit justified pushback replies), rerun required validation, and run the full PR feedback sweep until clear.
 5. After `Resolve PR Comments` work is complete and the `Human Review entry gate (hard requirement)` is satisfied, move the issue back to `Human Review`.
 6. If approved, human moves the issue to `Merging`.
-7. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-8. After merge is complete, move the issue to `Done`.
+7. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md` to squash-merge the PR and clean up the workspace (no additional review/check loop in this stage).
+8. After merge and cleanup are complete, move the issue to `Done`.
 
 ## Step 4: Rework handling
 

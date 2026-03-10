@@ -623,6 +623,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+    assert prompt =~ "Token budget guidance:"
+    assert prompt =~ "2,500,000 tokens per turn"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
@@ -669,7 +671,10 @@ defmodule SymphonyElixir.CoreTest do
       ]
     }
 
-    assert PromptBuilder.build_prompt(issue) == "Ticket MT-701"
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Ticket MT-701"
+    assert prompt =~ "Token budget guidance:"
   end
 
   test "prompt builder uses strict variable rendering" do
@@ -727,6 +732,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Title: Make fallback prompt useful"
     assert prompt =~ "Body:"
     assert prompt =~ "Include enough issue context to start working."
+    assert prompt =~ "Token budget guidance:"
     assert Config.workflow_prompt() =~ "{{ issue.identifier }}"
     assert Config.workflow_prompt() =~ "{{ issue.title }}"
     assert Config.workflow_prompt() =~ "{{ issue.description }}"
@@ -749,6 +755,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Identifier: MT-778"
     assert prompt =~ "Title: Handle empty body"
     assert prompt =~ "No description provided."
+    assert prompt =~ "Token budget guidance:"
   end
 
   test "prompt builder reports workflow load failures separately from template parse errors" do
@@ -811,6 +818,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
+    assert prompt =~ "Token budget guidance:"
   end
 
   test "prompt builder adds continuation guidance for retries" do
@@ -828,7 +836,8 @@ defmodule SymphonyElixir.CoreTest do
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
-    assert prompt == "Retry #2"
+    assert prompt =~ "Retry #2"
+    assert prompt =~ "Token budget guidance:"
   end
 
   test "agent runner keeps workspace after successful codex run" do
@@ -1131,6 +1140,7 @@ defmodule SymphonyElixir.CoreTest do
             ;;
           4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
+            printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"input_tokens":90000,"output_tokens":60000,"total_tokens":150000}}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           5)
@@ -1214,6 +1224,10 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "Token budget guidance:"
+      assert Enum.at(turn_texts, 1) =~ "2,500,000 tokens per turn"
+      assert Enum.at(turn_texts, 1) =~ "Current run usage so far: 150,000 tokens."
+      assert Enum.at(turn_texts, 1) =~ "Remaining before hard stops: 3,350,000 in this run"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

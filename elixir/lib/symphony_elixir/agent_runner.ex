@@ -32,8 +32,9 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp codex_message_handler(recipient, issue) do
+  defp codex_message_handler(recipient, issue, usage_tracker) do
     fn message ->
+      track_token_usage(usage_tracker, message)
       send_codex_update(recipient, issue, message)
     end
   end
@@ -49,15 +50,27 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    {:ok, usage_tracker} = Agent.start_link(fn -> %{input_tokens: 0, output_tokens: 0, total_tokens: 0} end)
 
     with {:ok, session} <- AppServer.start_session(workspace) do
       recipient_watcher = maybe_start_recipient_watcher(session, codex_update_recipient, issue)
 
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          usage_tracker,
+          opts,
+          issue_state_fetcher,
+          1,
+          max_turns
+        )
       after
         stop_recipient_watcher(recipient_watcher)
         AppServer.stop_session(session)
+        if Process.alive?(usage_tracker), do: Agent.stop(usage_tracker)
       end
     end
   end
@@ -93,15 +106,25 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+  defp do_run_codex_turns(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         usage_tracker,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    prompt = build_turn_prompt(issue, usage_tracker, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
+             on_message: codex_message_handler(codex_update_recipient, issue, usage_tracker)
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
@@ -114,6 +137,7 @@ defmodule SymphonyElixir.AgentRunner do
             workspace,
             refreshed_issue,
             codex_update_recipient,
+            usage_tracker,
             opts,
             issue_state_fetcher,
             turn_number + 1,
@@ -134,9 +158,11 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, _usage_tracker, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(_issue, usage_tracker, _opts, turn_number, max_turns) do
+    usage = current_token_usage(usage_tracker)
+
     """
     Continuation guidance:
 
@@ -145,6 +171,8 @@ defmodule SymphonyElixir.AgentRunner do
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+
+    #{PromptBuilder.budget_guidance(run_total_tokens: usage.total_tokens, issue_window_tokens: usage.total_tokens)}
     """
   end
 
@@ -185,4 +213,116 @@ defmodule SymphonyElixir.AgentRunner do
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
+
+  defp current_token_usage(usage_tracker) when is_pid(usage_tracker) do
+    Agent.get(usage_tracker, & &1)
+  catch
+    :exit, _reason -> %{input_tokens: 0, output_tokens: 0, total_tokens: 0}
+  end
+
+  defp current_token_usage(_usage_tracker), do: %{input_tokens: 0, output_tokens: 0, total_tokens: 0}
+
+  defp track_token_usage(usage_tracker, message) when is_pid(usage_tracker) and is_map(message) do
+    case absolute_token_usage_from_message(message) do
+      %{input_tokens: input_tokens, output_tokens: output_tokens, total_tokens: total_tokens} ->
+        Agent.update(usage_tracker, fn usage ->
+          %{
+            input_tokens: max(Map.get(usage, :input_tokens, 0), input_tokens),
+            output_tokens: max(Map.get(usage, :output_tokens, 0), output_tokens),
+            total_tokens: max(Map.get(usage, :total_tokens, 0), total_tokens)
+          }
+        end)
+
+      _ ->
+        :ok
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp track_token_usage(_usage_tracker, _message), do: :ok
+
+  defp absolute_token_usage_from_message(message) when is_map(message) do
+    payload = Map.get(message, :payload) || Map.get(message, "payload")
+    details = Map.get(message, :details) || Map.get(message, "details")
+
+    [message, payload, details]
+    |> Enum.find_value(&absolute_token_usage_from_payload/1)
+  end
+
+  defp absolute_token_usage_from_message(_message), do: nil
+
+  defp absolute_token_usage_from_payload(payload) when is_map(payload) do
+    absolute_paths = [
+      ["params", "msg", "payload", "info", "total_token_usage"],
+      [:params, :msg, :payload, :info, :total_token_usage],
+      ["params", "msg", "info", "total_token_usage"],
+      [:params, :msg, :info, :total_token_usage],
+      ["params", "tokenUsage", "total"],
+      [:params, :tokenUsage, :total],
+      ["tokenUsage", "total"],
+      [:tokenUsage, :total],
+      ["usage"],
+      [:usage],
+      ["params", "usage"],
+      [:params, :usage]
+    ]
+
+    Enum.find_value(absolute_paths, fn path ->
+      case map_at_path(payload, path) do
+        %{} = candidate ->
+          normalize_integer_token_map(candidate)
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp absolute_token_usage_from_payload(_payload), do: nil
+
+  defp map_at_path(value, []), do: value
+
+  defp map_at_path(value, [key | rest]) when is_map(value) do
+    case Map.fetch(value, key) do
+      {:ok, next} -> map_at_path(next, rest)
+      :error -> nil
+    end
+  end
+
+  defp map_at_path(_value, _path), do: nil
+
+  defp normalize_integer_token_map(candidate) when is_map(candidate) do
+    input_tokens = map_integer_value(candidate, ["input_tokens", :input_tokens, "input", :input])
+    output_tokens = map_integer_value(candidate, ["output_tokens", :output_tokens, "output", :output, "completion_tokens", :completion_tokens])
+    total_tokens = map_integer_value(candidate, ["total_tokens", :total_tokens, "total", :total])
+
+    if is_integer(input_tokens) and is_integer(output_tokens) and is_integer(total_tokens) do
+      %{input_tokens: input_tokens, output_tokens: output_tokens, total_tokens: total_tokens}
+    end
+  end
+
+  defp normalize_integer_token_map(_candidate), do: nil
+
+  defp map_integer_value(map, keys) when is_map(map) do
+    Enum.find_value(keys, fn key ->
+      case Map.fetch(map, key) do
+        {:ok, value} -> integer_like(value)
+        :error -> nil
+      end
+    end)
+  end
+
+  defp map_integer_value(_map, _keys), do: nil
+
+  defp integer_like(value) when is_integer(value) and value >= 0, do: value
+
+  defp integer_like(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {number, _} when number >= 0 -> number
+      _ -> nil
+    end
+  end
+
+  defp integer_like(_value), do: nil
 end

@@ -110,12 +110,12 @@ defmodule SymphonyElixir.TestSupport do
           continuation_retry_ms: 60_000,
           token_budget: %{
             enabled: true,
-            per_turn_soft_tokens: 150_000,
-            per_turn_hard_tokens: 250_000,
-            per_run_soft_tokens: 400_000,
-            per_run_hard_tokens: 600_000,
-            per_issue_window_soft_tokens: 1_000_000,
-            per_issue_window_hard_tokens: 1_500_000,
+            per_turn_soft_tokens: 2_000_000,
+            per_turn_hard_tokens: 2_500_000,
+            per_run_soft_tokens: 3_000_000,
+            per_run_hard_tokens: 3_500_000,
+            per_issue_window_soft_tokens: 8_000_000,
+            per_issue_window_hard_tokens: 12_000_000,
             issue_window_seconds: 86_400,
             comment_on_enforcement: true,
             pause_on_hard_limit: true

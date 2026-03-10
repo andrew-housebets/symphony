@@ -950,12 +950,19 @@ defmodule SymphonyElixir.StatusDashboard do
     remaining = map_value(bucket, ["remaining", :remaining])
     limit = map_value(bucket, ["limit", :limit])
 
-    reset_value =
+    window_mins =
+      map_value(bucket, ["windowDurationMins", :windowDurationMins, "window_duration_mins", :window_duration_mins])
+
+    reset_seconds =
       map_value(bucket, [
         "reset_in_seconds",
         :reset_in_seconds,
         "resetInSeconds",
-        :resetInSeconds,
+        :resetInSeconds
+      ])
+
+    reset_at =
+      map_value(bucket, [
         "reset_at",
         :reset_at,
         "resetAt",
@@ -966,32 +973,75 @@ defmodule SymphonyElixir.StatusDashboard do
         :resetsAt
       ])
 
-    base =
-      cond do
-        integer_like?(remaining) and integer_like?(limit) ->
-          "#{format_count(remaining)}/#{format_count(limit)}"
+    parts = []
 
-        integer_like?(remaining) ->
-          "remaining #{format_count(remaining)}"
+    # Progress bar with percentage
+    parts =
+      if integer_like?(remaining) and integer_like?(limit) and limit > 0 do
+        used = limit - remaining
+        pct = min(round(used / limit * 100), 100)
+        bar = format_progress_bar(pct, 15)
+        color = if pct >= 90, do: @ansi_red, else: if(pct >= 70, do: @ansi_orange, else: @ansi_green)
 
-        integer_like?(limit) ->
-          "limit #{format_count(limit)}"
-
-        map_size(bucket) == 0 ->
-          "n/a"
-
-        true ->
-          bucket |> inspect(limit: 6) |> truncate(40)
+        [colorize(bar, color) <> " " <> colorize("#{pct}%", color) <>
+          colorize(" (#{format_count(remaining)}/#{format_count(limit)})", @ansi_gray) | parts]
+      else
+        cond do
+          integer_like?(remaining) -> [colorize("remaining #{format_count(remaining)}", @ansi_cyan) | parts]
+          integer_like?(limit) -> [colorize("limit #{format_count(limit)}", @ansi_cyan) | parts]
+          map_size(bucket) == 0 -> ["n/a" | parts]
+          true -> [bucket |> inspect(limit: 6) |> truncate(40) | parts]
+        end
       end
 
-    if is_nil(reset_value) do
-      base
-    else
-      "#{base} reset #{format_reset_value(reset_value)}"
-    end
+    # Window duration in hours
+    parts =
+      if is_integer(window_mins) and window_mins > 0 do
+        window_text = format_duration_hours(window_mins)
+        [colorize("window #{window_text}", @ansi_gray) | parts]
+      else
+        parts
+      end
+
+    # Human-readable reset time
+    parts =
+      cond do
+        is_integer(reset_seconds) and reset_seconds > 0 ->
+          reset_dt = DateTime.add(DateTime.utc_now(), reset_seconds, :second)
+          [colorize("resets #{format_datetime_short(reset_dt)}", @ansi_gray) | parts]
+
+        is_binary(reset_at) ->
+          case DateTime.from_iso8601(reset_at) do
+            {:ok, dt, _} -> [colorize("resets #{format_datetime_short(dt)}", @ansi_gray) | parts]
+            _ -> [colorize("resets #{reset_at}", @ansi_gray) | parts]
+          end
+
+        true ->
+          parts
+      end
+
+    parts |> Enum.reverse() |> Enum.join(colorize(" | ", @ansi_gray))
   end
 
   defp format_rate_limit_bucket(other), do: to_string(other)
+
+  defp format_progress_bar(pct, width) do
+    filled = round(pct / 100 * width)
+    empty = width - filled
+    "[" <> String.duplicate("█", filled) <> String.duplicate("░", empty) <> "]"
+  end
+
+  defp format_duration_hours(mins) when mins >= 60 do
+    hours = div(mins, 60)
+    rem_mins = rem(mins, 60)
+    if rem_mins == 0, do: "#{hours}h", else: "#{hours}h#{rem_mins}m"
+  end
+
+  defp format_duration_hours(mins), do: "#{mins}m"
+
+  defp format_datetime_short(dt) do
+    Calendar.strftime(dt, "%H:%M:%S UTC")
+  end
 
   defp format_rate_limit_credits(nil), do: "credits n/a"
 
@@ -1017,9 +1067,6 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_rate_limit_credits(other), do: "credits #{to_string(other)}"
 
-  defp format_reset_value(value) when is_integer(value), do: "#{format_count(value)}s"
-  defp format_reset_value(value) when is_binary(value), do: value
-  defp format_reset_value(value), do: to_string(value)
 
   defp format_number(value) when is_integer(value), do: format_count(value)
 

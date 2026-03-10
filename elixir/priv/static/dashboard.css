@@ -335,6 +335,40 @@ pre,
   min-width: 0;
 }
 
+.stdout-details {
+  margin-top: 0.2rem;
+}
+
+.stdout-summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  user-select: none;
+}
+
+.stdout-summary:hover {
+  color: var(--ink);
+}
+
+.stdout-log {
+  margin-top: 0.45rem;
+  max-height: 13.5rem;
+  overflow: auto;
+  padding: 0.6rem;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #f5f5f7;
+  color: #353740;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.stdout-empty {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+}
+
 .event-text {
   font-weight: 500;
   line-height: 1.45;

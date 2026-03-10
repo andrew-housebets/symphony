@@ -185,6 +185,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
                           >
                             Copy ID
                           </button>
+
+                          <details class="stdout-details">
+                            <summary class="stdout-summary">
+                              View stdout (<%= stdout_line_count(entry.stdout) %>)
+                            </summary>
+
+                            <%= if stdout_line_count(entry.stdout) == 0 do %>
+                              <p class="stdout-empty muted">No stdout captured yet.</p>
+                            <% else %>
+                              <pre class="stdout-log"><%= format_stdout(entry.stdout) %></pre>
+                            <% end %>
+                          </details>
                         <% else %>
                           <span class="muted">n/a</span>
                         <% end %>
@@ -332,6 +344,34 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp stdout_line_count(stdout_entries) when is_list(stdout_entries), do: length(stdout_entries)
+  defp stdout_line_count(_stdout_entries), do: 0
+
+  defp format_stdout(stdout_entries) when is_list(stdout_entries) do
+    stdout_entries
+    |> Enum.map(&format_stdout_entry/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
+  end
+
+  defp format_stdout(_stdout_entries), do: ""
+
+  defp format_stdout_entry(%{at: at, text: text}) when is_binary(text) do
+    case at do
+      timestamp when is_binary(timestamp) and timestamp != "" -> "[#{timestamp}] #{text}"
+      _ -> text
+    end
+  end
+
+  defp format_stdout_entry(%{"at" => at, "text" => text}) when is_binary(text) do
+    case at do
+      timestamp when is_binary(timestamp) and timestamp != "" -> "[#{timestamp}] #{text}"
+      _ -> text
+    end
+  end
+
+  defp format_stdout_entry(_entry), do: ""
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

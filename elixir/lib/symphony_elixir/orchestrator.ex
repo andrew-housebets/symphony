@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @max_session_stdout_entries 200
+  @max_session_stdout_bytes 2_000
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -681,6 +683,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            session_stdout: [],
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -996,6 +999,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          session_stdout: Map.get(metadata, :session_stdout, []),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1057,6 +1061,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    session_stdout = session_stdout_for_update(Map.get(running_entry, :session_stdout, []), update)
 
     {
       Map.merge(running_entry, %{
@@ -1071,7 +1076,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
-        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
+        turn_count: turn_count_for_update(turn_count, running_entry.session_id, update),
+        session_stdout: session_stdout
       }),
       token_delta
     }
@@ -1120,6 +1126,52 @@ defmodule SymphonyElixir.Orchestrator do
       timestamp: update[:timestamp]
     }
   end
+
+  defp session_stdout_for_update(session_stdout, update) when is_list(session_stdout) do
+    case stdout_entry_from_update(update) do
+      nil ->
+        session_stdout
+
+      stdout_entry ->
+        appended = session_stdout ++ [stdout_entry]
+        overflow = length(appended) - @max_session_stdout_entries
+
+        if overflow > 0 do
+          Enum.drop(appended, overflow)
+        else
+          appended
+        end
+    end
+  end
+
+  defp session_stdout_for_update(_session_stdout, update), do: session_stdout_for_update([], update)
+
+  defp stdout_entry_from_update(%{event: :malformed} = update) do
+    case sanitize_session_stdout_text(update[:payload] || update[:raw]) do
+      nil -> nil
+      text -> %{timestamp: update_timestamp(update), text: text}
+    end
+  end
+
+  defp stdout_entry_from_update(_update), do: nil
+
+  defp update_timestamp(%{timestamp: %DateTime{} = timestamp}), do: timestamp
+  defp update_timestamp(_update), do: DateTime.utc_now()
+
+  defp sanitize_session_stdout_text(text) when is_binary(text) do
+    text
+    |> String.replace(~r/\x1B\[[0-9;]*[A-Za-z]/, "")
+    |> String.replace(~r/\x1B./, "")
+    |> String.replace(~r/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/, "")
+    |> String.trim_trailing()
+    |> String.slice(0, @max_session_stdout_bytes)
+    |> case do
+      "" -> nil
+      sanitized -> sanitized
+    end
+  end
+
+  defp sanitize_session_stdout_text(_text), do: nil
 
   defp schedule_tick(delay_ms) do
     :timer.send_after(delay_ms, self(), :tick)

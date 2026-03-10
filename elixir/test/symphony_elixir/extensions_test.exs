@@ -354,6 +354,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
+                 "stdout" => [],
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -457,6 +458,48 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
+  test "phoenix observability API exposes captured session stdout in state and issue payloads" do
+    [running_entry] = static_snapshot().running
+
+    snapshot = %{
+      static_snapshot()
+      | running: [
+          Map.put(running_entry, :session_stdout, [
+            %{timestamp: ~U[2026-03-10 10:00:00Z], text: "stdout hello"},
+            %{timestamp: ~U[2026-03-10 10:00:01Z], text: "stdout world"}
+          ])
+        ]
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :StdoutObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    [running_payload] = state_payload["running"]
+
+    assert running_payload["stdout"] == [
+             %{"at" => "2026-03-10T10:00:00Z", "text" => "stdout hello"},
+             %{"at" => "2026-03-10T10:00:01Z", "text" => "stdout world"}
+           ]
+
+    issue_payload = json_response(get(build_conn(), "/api/v1/MT-HTTP"), 200)
+
+    assert issue_payload["logs"] == %{
+             "codex_session_logs" => [
+               %{"at" => "2026-03-10T10:00:00Z", "text" => "stdout hello"},
+               %{"at" => "2026-03-10T10:00:01Z", "text" => "stdout world"}
+             ]
+           }
+  end
+
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)
@@ -541,6 +584,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
+    assert html =~ "View stdout (0)"
     assert html =~ "Codex update"
     assert html =~ "Configured model:"
     assert html =~ "gpt-5.3-codex"

@@ -78,7 +78,7 @@ defmodule SymphonyElixirWeb.Presenter do
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
       logs: %{
-        codex_session_logs: []
+        codex_session_logs: codex_session_logs_payload(running)
       },
       recent_events: (running && recent_events_payload(running)) || [],
       last_error: retry && retry.error,
@@ -108,6 +108,7 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
+      stdout: codex_session_logs_payload(entry),
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
@@ -161,6 +162,24 @@ defmodule SymphonyElixirWeb.Presenter do
     ]
     |> Enum.reject(&is_nil(&1.at))
   end
+
+  defp codex_session_logs_payload(nil), do: []
+
+  defp codex_session_logs_payload(%{session_stdout: session_stdout}) do
+    session_stdout
+    |> List.wrap()
+    |> Enum.map(&session_stdout_entry_payload/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp codex_session_logs_payload(_running_entry), do: []
+
+  defp session_stdout_entry_payload(%{text: text} = entry) when is_binary(text) do
+    timestamp = Map.get(entry, :timestamp)
+    %{at: iso8601(timestamp), text: text}
+  end
+
+  defp session_stdout_entry_payload(_entry), do: nil
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)

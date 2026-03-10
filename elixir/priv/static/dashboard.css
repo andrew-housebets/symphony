@@ -207,41 +207,37 @@ pre,
 }
 
 .status-badge-dot {
-  width: 0.52rem;
-  height: 0.52rem;
+  width: 0.5rem;
+  height: 0.5rem;
   border-radius: 999px;
   background: currentColor;
-  opacity: 0.9;
 }
 
 .status-badge-live {
   display: none;
-  background: rgba(37, 194, 160, 0.14);
-  border-color: rgba(37, 194, 160, 0.3);
-  color: #5eecc5;
-  text-shadow: 0 0 10px rgba(94, 236, 197, 0.4);
+  background: #132d21;
+  border-color: #113b29;
+  color: #b1f1cb;
 }
 
 .status-badge-live .status-badge-dot {
-  background: #5eecc5;
-  box-shadow: 0 0 6px 2px rgba(94, 236, 197, 0.5);
-  animation: pulse-glow 2s ease-in-out infinite;
+  background: #3dd68c;
+  animation: pulse-dot 2s ease-in-out infinite;
 }
 
-@keyframes pulse-glow {
-  0%, 100% { box-shadow: 0 0 6px 2px rgba(94, 236, 197, 0.5); opacity: 1; }
-  50% { box-shadow: 0 0 10px 4px rgba(94, 236, 197, 0.7); opacity: 0.7; }
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 .status-badge-offline {
-  background: rgba(24, 36, 49, 0.8);
-  border-color: rgba(59, 80, 100, 0.5);
-  color: #7a91a6;
+  background: #212225;
+  border-color: #2e3135;
+  color: #777b84;
 }
 
 .status-badge-offline .status-badge-dot {
-  background: #7a91a6;
-  opacity: 0.6;
+  background: #696e77;
 }
 
 [data-phx-main].phx-connected .status-badge-live {
@@ -518,24 +514,21 @@ pre,
 }
 
 .state-badge-active {
-  background: rgba(37, 194, 160, 0.14);
-  border-color: rgba(37, 194, 160, 0.3);
-  color: #5eecc5;
-  text-shadow: 0 0 8px rgba(94, 236, 197, 0.3);
+  background: #132d21;
+  border-color: #113b29;
+  color: #b1f1cb;
 }
 
 .state-badge-warning {
-  background: rgba(255, 183, 77, 0.12);
-  border-color: rgba(255, 183, 77, 0.3);
-  color: #ffcf7a;
-  text-shadow: 0 0 8px rgba(255, 207, 122, 0.25);
+  background: #302008;
+  border-color: #3f2700;
+  color: #ffe7b3;
 }
 
 .state-badge-danger {
-  background: rgba(255, 127, 115, 0.12);
-  border-color: rgba(255, 127, 115, 0.3);
-  color: #ff9f95;
-  text-shadow: 0 0 8px rgba(255, 159, 149, 0.25);
+  background: #3b1219;
+  border-color: #611623;
+  color: #ffd1d9;
 }
 
 .issue-id {
@@ -570,20 +563,20 @@ pre,
 .error-card {
   border-radius: 24px;
   padding: 1.25rem;
-  background: linear-gradient(180deg, #3a1e24 0%, var(--danger-soft) 100%);
-  border-color: #7c3941;
+  background: #3b1219;
+  border-color: #8c333a;
 }
 
 .error-title {
   margin: 0;
-  color: var(--danger);
+  color: #ff9592;
   font-size: 1.15rem;
   letter-spacing: -0.02em;
 }
 
 .error-copy {
   margin: 0.45rem 0 0;
-  color: var(--danger);
+  color: #ffd1d9;
 }
 
 @media (max-width: 860px) {

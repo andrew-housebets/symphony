@@ -13,6 +13,7 @@ defmodule SymphonyElixir.CoreTest do
 
     assert Config.poll_interval_ms() == 30_000
     assert Config.linear_active_states() == ["Todo", "In Progress"]
+    assert Config.linear_paused_states() == ["Human Review"]
     assert Config.linear_terminal_states() == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert Config.linear_assignee() == nil
     assert Config.agent_max_turns() == 20
@@ -31,6 +32,9 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert Config.linear_active_states() == ["Todo", "Review"]
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_paused_states: "Human Review, Waiting")
+    assert Config.linear_paused_states() == ["Human Review", "Waiting"]
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "token",
@@ -370,6 +374,55 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.has_key?(updated_state.running, issue_id)
     assert MapSet.member?(updated_state.claimed, issue_id)
     assert updated_entry.issue.state == "In Progress"
+  end
+
+  test "reconcile stops running issue when it moves into paused review state" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Human Review"]
+    )
+
+    issue_id = "issue-paused"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-562",
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-562",
+            state: "In Progress"
+          },
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-562",
+      state: "Human Review",
+      title: "Waiting for human approval",
+      description: "Should not execute Codex turns",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Process.alive?(agent_pid)
   end
 
   test "reconcile stops running issue when it is reassigned away from this worker" do

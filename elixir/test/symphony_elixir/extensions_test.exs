@@ -372,7 +372,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "requested_model" => "gpt-5.3-codex",
+             "effective_model" => "gpt-5.3-codex",
+             "rate_limit_bucket_model" => "GPT-5.3-Codex-Spark"
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -539,6 +542,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ "Configured model:"
+    assert html =~ "gpt-5.3-codex"
+    assert html =~ "Rate-limit bucket:"
+    assert html =~ "GPT-5.3-Codex-Spark"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -703,7 +710,10 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      requested_model: "gpt-5.3-codex",
+      effective_model: "gpt-5.3-codex",
+      rate_limit_bucket_model: "GPT-5.3-Codex-Spark"
     }
   end
 

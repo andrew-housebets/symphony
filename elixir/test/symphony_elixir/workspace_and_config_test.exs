@@ -477,6 +477,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "paused issue state is not dispatch-eligible even when listed as active" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Human Review"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "paused-1",
+      identifier: "MT-1008",
+      title: "Waiting for review",
+      state: "Human Review",
+      blocked_by: []
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do
     stale_issue = %Issue{
       id: "blocked-2",
@@ -705,6 +729,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ",")
     assert Config.linear_active_states() == ["Todo", "In Progress"]
 
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_paused_states: ",")
+    assert Config.linear_paused_states() == ["Human Review"]
+
     write_workflow_file!(Workflow.workflow_file_path(), max_concurrent_agents: "bad")
     assert Config.max_concurrent_agents() == 10
 
@@ -719,6 +746,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
+      tracker_paused_states: %{review: true},
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},
       workspace_root: 123,
@@ -733,6 +761,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     )
 
     assert Config.linear_active_states() == ["Todo", "In Progress"]
+    assert Config.linear_paused_states() == ["Human Review"]
     assert Config.linear_terminal_states() == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert Config.poll_interval_ms() == 30_000
     assert Config.workspace_root() == Path.join(System.tmp_dir!(), "symphony_workspaces")

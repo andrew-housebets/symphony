@@ -20,7 +20,10 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          requested_model: Map.get(snapshot, :requested_model),
+          effective_model: Map.get(snapshot, :effective_model),
+          rate_limit_bucket_model: Map.get(snapshot, :rate_limit_bucket_model)
         }
 
       :timeout ->

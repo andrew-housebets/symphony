@@ -388,6 +388,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "orchestrator snapshot tracks codex rate-limit payloads" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      codex_command: "codex app-server --model gpt-5.3-codex"
+    )
+
     issue_id = "issue-rate-limit-snapshot"
 
     issue = %Issue{
@@ -438,6 +443,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     rate_limits = %{
       "limit_id" => "codex",
+      "limit_name" => "GPT-5.3-Codex-Spark",
       "primary" => %{"remaining" => 90, "limit" => 100},
       "secondary" => nil,
       "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil}
@@ -460,12 +466,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              }
            }
          },
+         model: "gpt-5.3-codex",
          timestamp: DateTime.utc_now()
        }}
     )
 
     snapshot = GenServer.call(pid, :snapshot)
     assert snapshot.rate_limits == rate_limits
+    assert snapshot.requested_model == "gpt-5.3-codex"
+    assert snapshot.effective_model == "gpt-5.3-codex"
+    assert snapshot.rate_limit_bucket_model == "GPT-5.3-Codex-Spark"
   end
 
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do

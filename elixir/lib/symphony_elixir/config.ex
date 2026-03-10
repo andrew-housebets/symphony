@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Config do
   alias SymphonyElixir.Workflow
 
   @default_active_states ["Todo", "In Progress"]
+  @default_paused_states ["Human Review"]
   @default_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
   @default_linear_endpoint "https://api.linear.app/graphql"
   @default_prompt_template """
@@ -57,6 +58,10 @@ defmodule SymphonyElixir.Config do
                                  active_states: [
                                    type: {:list, :string},
                                    default: @default_active_states
+                                 ],
+                                 paused_states: [
+                                   type: {:list, :string},
+                                   default: @default_paused_states
                                  ],
                                  terminal_states: [
                                    type: {:list, :string},
@@ -217,6 +222,11 @@ defmodule SymphonyElixir.Config do
   @spec linear_terminal_states() :: [String.t()]
   def linear_terminal_states do
     get_in(validated_workflow_options(), [:tracker, :terminal_states])
+  end
+
+  @spec linear_paused_states() :: [String.t()]
+  def linear_paused_states do
+    get_in(validated_workflow_options(), [:tracker, :paused_states])
   end
 
   @spec poll_interval_ms() :: pos_integer()
@@ -464,6 +474,7 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:api_key, binary_value(Map.get(section, "api_key"), allow_empty: true))
     |> put_if_present(:project_slug, scalar_string_value(Map.get(section, "project_slug")))
     |> put_if_present(:active_states, csv_value(Map.get(section, "active_states")))
+    |> put_if_present(:paused_states, csv_value(Map.get(section, "paused_states")))
     |> put_if_present(:terminal_states, csv_value(Map.get(section, "terminal_states")))
   end
 

@@ -110,9 +110,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Rate limits</h2>
-              <p class="section-copy">Latest upstream rate-limit snapshot, when available.</p>
+              <p class="section-copy">
+                Configured and runtime-reported model identity, alongside the latest upstream rate-limit snapshot.
+              </p>
             </div>
           </div>
+
+          <p class="section-copy">
+            Configured model: <span class="mono"><%= display_model(@payload.requested_model) %></span>
+          </p>
+          <p class="section-copy">
+            Runtime-reported model: <span class="mono"><%= display_model(@payload.effective_model) %></span>
+          </p>
+          <p class="section-copy">
+            Rate-limit bucket: <span class="mono"><%= display_model(@payload.rate_limit_bucket_model) %></span>
+          </p>
 
           <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
         </section>
@@ -327,4 +339,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+
+  defp display_model(nil), do: "n/a"
+  defp display_model(value) when is_binary(value), do: value
+  defp display_model(value), do: to_string(value)
 end

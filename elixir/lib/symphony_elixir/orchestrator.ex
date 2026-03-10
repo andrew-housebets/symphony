@@ -148,6 +148,18 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
+        event = Map.get(update, :event)
+        payload = update[:payload] || Map.get(update, "payload")
+        method = if is_map(payload), do: Map.get(payload, "method") || Map.get(payload, :method)
+
+        if event in [:session_started, :turn_completed, :notification] do
+          Logger.debug(
+            "codex_worker_update [#{event}] method=#{inspect(method)} " <>
+              "raw_keys=#{inspect(Map.keys(update))} " <>
+              "payload_sample=#{inspect(payload, limit: 500, printable_limit: 300)}"
+          )
+        end
+
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
         state =
@@ -670,6 +682,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)}")
 
+        maybe_move_to_in_progress(issue)
+
         running =
           Map.put(state.running, issue.id, %{
             pid: pid,
@@ -708,6 +722,20 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           error: "failed to spawn agent: #{inspect(reason)}"
         })
+    end
+  end
+
+  defp maybe_move_to_in_progress(%Issue{} = issue) do
+    normalized = normalize_issue_state(issue.state)
+
+    if normalized != "in progress" do
+      case Tracker.update_issue_state(issue.id, "In Progress") do
+        :ok ->
+          Logger.info("Moved issue to In Progress: #{issue_context(issue)}")
+
+        {:error, reason} ->
+          Logger.warning("Failed to move issue to In Progress: #{issue_context(issue)} reason=#{inspect(reason)}")
+      end
     end
   end
 
@@ -1283,7 +1311,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_codex_effective_model(%State{} = state, update) when is_map(update) do
     case extract_effective_model(update) do
       nil -> state
-      model -> %{state | codex_effective_model: model}
+      model ->
+        Logger.info("codex_effective_model set to #{inspect(model)}")
+        %{state | codex_effective_model: model}
     end
   end
 
@@ -1375,25 +1405,62 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_rate_limits(update) do
-    rate_limits_from_payload(map_at_path(update, ["params", "rateLimits"])) ||
-      rate_limits_from_payload(map_at_path(update, [:params, :rateLimits])) ||
-      rate_limits_from_payload(update[:rate_limits]) ||
-      rate_limits_from_payload(Map.get(update, "rate_limits")) ||
-      rate_limits_from_payload(Map.get(update, :rate_limits)) ||
-      rate_limits_from_payload(update[:payload]) ||
-      rate_limits_from_payload(Map.get(update, "payload")) ||
-      rate_limits_from_payload(update)
+    result =
+      rate_limits_from_payload(map_at_path(update, ["params", "rateLimits"])) ||
+        rate_limits_from_payload(map_at_path(update, [:params, :rateLimits])) ||
+        rate_limits_from_payload(update[:rate_limits]) ||
+        rate_limits_from_payload(Map.get(update, "rate_limits")) ||
+        rate_limits_from_payload(Map.get(update, :rate_limits)) ||
+        rate_limits_from_payload(update[:payload]) ||
+        rate_limits_from_payload(Map.get(update, "payload")) ||
+        rate_limits_from_payload(update)
+
+    if is_nil(result) do
+      event = Map.get(update, :event)
+      payload = update[:payload] || Map.get(update, "payload")
+      method = if is_map(payload), do: Map.get(payload, "method") || Map.get(payload, :method)
+      params = if is_map(payload), do: Map.get(payload, "params") || Map.get(payload, :params)
+      params_keys = if is_map(params), do: Map.keys(params), else: nil
+
+      Logger.debug(
+        "extract_rate_limits: no rate limits found — " <>
+          "event=#{inspect(event)} method=#{inspect(method)} " <>
+          "params_keys=#{inspect(params_keys)}"
+      )
+    end
+
+    result
   end
 
   defp extract_effective_model(update) do
-    model_identifier_from_payload(update[:effective_model]) ||
-      model_identifier_from_payload(Map.get(update, "effective_model")) ||
-      model_identifier_from_payload(Map.get(update, :effective_model)) ||
-      model_identifier_from_payload(update[:model]) ||
-      model_identifier_from_payload(Map.get(update, "model")) ||
-      model_identifier_from_payload(Map.get(update, :model)) ||
-      payload_effective_model(update[:payload]) ||
-      payload_effective_model(Map.get(update, "payload"))
+    result =
+      model_identifier_from_payload(update[:effective_model]) ||
+        model_identifier_from_payload(Map.get(update, "effective_model")) ||
+        model_identifier_from_payload(Map.get(update, :effective_model)) ||
+        model_identifier_from_payload(update[:model]) ||
+        model_identifier_from_payload(Map.get(update, "model")) ||
+        model_identifier_from_payload(Map.get(update, :model)) ||
+        payload_effective_model(update[:payload]) ||
+        payload_effective_model(Map.get(update, "payload"))
+
+    if is_nil(result) do
+      event = Map.get(update, :event)
+      payload = update[:payload] || Map.get(update, "payload")
+      method = if is_map(payload), do: Map.get(payload, "method") || Map.get(payload, :method)
+      payload_keys = if is_map(payload), do: Map.keys(payload), else: nil
+      params = if is_map(payload), do: Map.get(payload, "params") || Map.get(payload, :params)
+      params_keys = if is_map(params), do: Map.keys(params), else: nil
+
+      Logger.debug(
+        "extract_effective_model: no model found — " <>
+          "event=#{inspect(event)} method=#{inspect(method)} " <>
+          "update_keys=#{inspect(Map.keys(update))} " <>
+          "payload_keys=#{inspect(payload_keys)} " <>
+          "params_keys=#{inspect(params_keys)}"
+      )
+    end
+
+    result
   end
 
   defp payload_effective_model(payload) when is_map(payload) do

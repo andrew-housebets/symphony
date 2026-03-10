@@ -1,5 +1,15 @@
 import Config
 
+log_level =
+  case System.get_env("LOG_LEVEL") do
+    "debug" -> :debug
+    "warning" -> :warning
+    "error" -> :error
+    _ -> :info
+  end
+
+config :logger, level: log_level
+
 config :phoenix, :json_library, Jason
 
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,

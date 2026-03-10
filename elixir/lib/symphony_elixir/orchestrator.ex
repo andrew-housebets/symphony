@@ -1507,14 +1507,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_rate_limits(update) do
+    payload = update[:payload] || Map.get(update, "payload")
+
     result =
       rate_limits_from_payload(map_at_path(update, ["params", "rateLimits"])) ||
         rate_limits_from_payload(map_at_path(update, [:params, :rateLimits])) ||
+        rate_limits_from_payload(map_at_path(payload, ["params", "msg", "rate_limits"])) ||
+        rate_limits_from_payload(map_at_path(payload, [:params, :msg, :rate_limits])) ||
         rate_limits_from_payload(update[:rate_limits]) ||
         rate_limits_from_payload(Map.get(update, "rate_limits")) ||
         rate_limits_from_payload(Map.get(update, :rate_limits)) ||
-        rate_limits_from_payload(update[:payload]) ||
-        rate_limits_from_payload(Map.get(update, "payload")) ||
+        rate_limits_from_payload(payload) ||
         rate_limits_from_payload(update)
 
     if is_nil(result) do
@@ -1822,14 +1825,14 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.sort_by(fn {bucket_key, _rate_limits} -> to_string(bucket_key) end)
 
     by_effective_model =
-      Enum.find(entries, fn {_bucket_key, rate_limits} ->
-        bucket_matches_model?(rate_limits, effective_model)
-      end)
+      entries
+      |> Enum.filter(fn {_bucket_key, rate_limits} -> bucket_matches_model?(rate_limits, effective_model) end)
+      |> best_matching_bucket()
 
     by_requested_model =
-      Enum.find(entries, fn {_bucket_key, rate_limits} ->
-        bucket_matches_model?(rate_limits, requested_model)
-      end)
+      entries
+      |> Enum.filter(fn {_bucket_key, rate_limits} -> bucket_matches_model?(rate_limits, requested_model) end)
+      |> best_matching_bucket()
 
     by_highest_usage =
       Enum.max_by(entries, fn {_bucket_key, rate_limits} -> bucket_primary_used_percent(rate_limits) end, fn -> nil end)
@@ -1848,6 +1851,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp select_rate_limit_bucket_key(_buckets, _latest_bucket_key, _requested_model, _effective_model), do: nil
+
+  # When multiple buckets match a model, prefer the one with actual usage.
+  defp best_matching_bucket([]), do: nil
+  defp best_matching_bucket([single]), do: single
+
+  defp best_matching_bucket(candidates) do
+    Enum.max_by(candidates, fn {_bucket_key, rate_limits} ->
+      bucket_primary_used_percent(rate_limits)
+    end)
+  end
 
   defp bucket_matches_model?(rate_limits, model) when is_map(rate_limits) and is_binary(model) do
     normalized_model = String.downcase(String.trim(model))

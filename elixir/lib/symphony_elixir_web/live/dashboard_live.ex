@@ -847,7 +847,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp mailbox_badge_class(n) when n >= 10, do: "mbx-badge mbx-warn numeric"
   defp mailbox_badge_class(_), do: "mbx-badge mbx-ok numeric"
 
-  defp display_model(nil), do: "n/a"
+  defp display_model(nil), do: "-"
   defp display_model(v) when is_binary(v), do: v
   defp display_model(v), do: to_string(v)
 

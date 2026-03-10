@@ -86,6 +86,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 ## Default posture
 
 - Start by determining the ticket's current status, then follow the matching flow for that status.
+- Enforce branch policy before implementation: branch names must use conventional prefixes (`build/`, `chore/`, `ci/`, `docs/`, `feat/`, `fix/`, `perf/`, `refactor/`, `revert/`, `style/`, or `test/`), and active work must run on the Linear issue branch.
 - Start every task by opening the tracking workpad comment and bringing it up to date before doing new implementation work.
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
@@ -114,7 +115,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 ## Status map
 
 - `Backlog` -> out of scope for this workflow; do not modify.
-- `Todo` -> queued; immediately transition to `In Progress` before active work.
+- `Todo` -> queued; ensure branch policy/alignment first, then transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
@@ -139,6 +140,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
 5. For `Todo` tickets, do startup sequencing in this exact order:
+   - Ensure `issue.branchName` is set and valid for this ticket before any state change.
+     - Valid format: `<type>/<slug>` where `<type>` is one of `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, or `test`.
+     - If missing/invalid, update the issue branch name first, then create/switch local branch to match.
    - `update_issue(..., state: "In Progress")`
    - find/create `## Codex Workpad` bootstrap comment
    - only then begin analysis/planning/implementation work.
@@ -226,6 +230,8 @@ Use this only when completion is blocked by missing required tools or missing au
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)
 
 1. Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
+   - If `git branch --show-current` does not match Linear `issue.branchName`, stop and fix branch alignment first.
+   - If the branch is missing or invalid, set Linear `branchName` and local branch to a conventional name (`build/`, `chore/`, `ci/`, `docs/`, `feat/`, `fix/`, `perf/`, `refactor/`, `revert/`, `style/`, or `test/`) before coding.
 2. If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
 3. Load the existing workpad comment and treat it as the active execution checklist.
     - Edit it liberally whenever reality changes (scope, risks, validation approach, discovered tasks).

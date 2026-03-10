@@ -435,6 +435,144 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
   end
 
+  test "linear_graphql blocks In Progress transition when branch name is missing" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => issue_state_update_query(),
+          "variables" => %{"issueId" => "issue-123", "stateId" => "state-in-progress"}
+        },
+        linear_client: fn query, _variables, _opts ->
+          if query =~ "query SymphonyHumanReviewGateIssue" do
+            {:ok, human_review_gate_issue_response("In Progress", "state-in-progress", nil)}
+          else
+            flunk("mutation should not run when branch name is missing")
+          end
+        end,
+        command_runner: fn _command, _args, _opts ->
+          flunk("GitHub checks should not run when branch policy gate fails")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert [
+             %{
+               "text" => text
+             }
+           ] = response["contentItems"]
+
+    assert %{
+             "error" => %{
+               "message" => message
+             }
+           } = Jason.decode!(text)
+
+    assert message =~ "branch name is required"
+  end
+
+  test "linear_graphql blocks In Progress transition when branch name is not conventional" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => issue_state_update_query(),
+          "variables" => %{"issueId" => "issue-123", "stateId" => "state-in-progress"}
+        },
+        linear_client: fn query, _variables, _opts ->
+          if query =~ "query SymphonyHumanReviewGateIssue" do
+            {:ok, human_review_gate_issue_response("In Progress", "state-in-progress", "andrew/issue-123")}
+          else
+            flunk("mutation should not run when branch name is invalid")
+          end
+        end,
+        command_runner: fn _command, _args, _opts ->
+          flunk("GitHub checks should not run when branch policy gate fails")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert [
+             %{
+               "text" => text
+             }
+           ] = response["contentItems"]
+
+    assert %{
+             "error" => %{
+               "message" => message
+             }
+           } = Jason.decode!(text)
+
+    assert message =~ "does not follow conventional format"
+  end
+
+  test "linear_graphql allows In Progress transition when branch name is supplied in the mutation" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => issue_state_and_branch_update_query(),
+          "variables" => %{
+            "issueId" => "issue-123",
+            "stateId" => "state-in-progress",
+            "branchName" => "fix/issue-123"
+          }
+        },
+        linear_client: fn query, variables, _opts ->
+          if query =~ "query SymphonyHumanReviewGateIssue" do
+            {:ok, human_review_gate_issue_response("In Progress", "state-in-progress", nil)}
+          else
+            assert query =~ "mutation MoveIssueBranch"
+            assert variables["branchName"] == "fix/issue-123"
+            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+          end
+        end,
+        command_runner: fn _command, _args, _opts ->
+          flunk("GitHub checks should not run for non-Human Review transitions")
+        end
+      )
+
+    assert response["success"] == true
+  end
+
+  test "linear_graphql accepts all supported conventional branch prefixes for active states" do
+    prefixes = ~w(build chore ci docs feat fix perf refactor revert style test)
+
+    for prefix <- prefixes do
+      branch_name = "#{prefix}/issue-123"
+
+      response =
+        DynamicTool.execute(
+          "linear_graphql",
+          %{
+            "query" => issue_state_and_branch_update_query(),
+            "variables" => %{
+              "issueId" => "issue-123",
+              "stateId" => "state-in-progress",
+              "branchName" => branch_name
+            }
+          },
+          linear_client: fn query, variables, _opts ->
+            if query =~ "query SymphonyHumanReviewGateIssue" do
+              {:ok, human_review_gate_issue_response("In Progress", "state-in-progress", nil)}
+            else
+              assert query =~ "mutation MoveIssueBranch"
+              assert variables["branchName"] == branch_name
+              {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+            end
+          end,
+          command_runner: fn _command, _args, _opts ->
+            flunk("GitHub checks should not run for non-Human Review transitions")
+          end
+        )
+
+      assert response["success"] == true
+    end
+  end
+
   test "linear_graphql blocks Human Review transition when checks are still pending" do
     response =
       DynamicTool.execute(
@@ -455,7 +593,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             {:ok, "ok"}
 
           "gh", ["pr", "list" | _rest], _opts ->
-            {:ok, ~s([{"number":42,"url":"https://github.com/example/repo/pull/42","headRefName":"feature/issue-123"}])}
+            {:ok, ~s([{"number":42,"url":"https://github.com/example/repo/pull/42","headRefName":"feat/issue-123"}])}
 
           "gh", ["pr", "view", "42" | _rest], _opts ->
             {:ok,
@@ -503,7 +641,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
             {:ok, "ok"}
 
           "gh", ["pr", "list" | _rest], _opts ->
-            {:ok, ~s([{"number":42,"url":"https://github.com/example/repo/pull/42","headRefName":"feature/issue-123"}])}
+            {:ok, ~s([{"number":42,"url":"https://github.com/example/repo/pull/42","headRefName":"feat/issue-123"}])}
 
           "gh", ["pr", "view", "42" | _rest], _opts ->
             {:ok,
@@ -534,6 +672,43 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert message =~ "bot review feedback exists after the latest PR commit"
   end
 
+  test "linear_graphql resolves repository from PR URL when PR metadata omits nameWithOwner" do
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{
+          "query" => issue_state_update_query(),
+          "variables" => %{"issueId" => "issue-123", "stateId" => "state-human-review"}
+        },
+        linear_client: fn query, _variables, _opts ->
+          if query =~ "query SymphonyHumanReviewGateIssue" do
+            {:ok, human_review_gate_issue_response("Human Review")}
+          else
+            {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+          end
+        end,
+        command_runner: fn
+          "gh", ["auth", "status"], _opts ->
+            {:ok, "ok"}
+
+          "gh", ["pr", "list" | _rest], _opts ->
+            {:ok, ~s([{"number":42,"url":"https://github.com/example/repo/pull/42","headRefName":"feat/issue-123"}])}
+
+          "gh", ["pr", "view", "42" | _rest], _opts ->
+            {:ok,
+             ~s({"number":42,"url":"https://github.com/example/repo/pull/42","state":"OPEN","headRepository":{"nameWithOwner":""},"comments":[],"reviews":[],"commits":[{"committedDate":"2026-03-10T10:00:00Z"}],"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]})}
+
+          "gh", ["api", "repos/example/repo/pulls/42/comments?per_page=100"], _opts ->
+            {:ok, "[]"}
+
+          _command, _args, _opts ->
+            flunk("unexpected command runner invocation")
+        end
+      )
+
+    assert response["success"] == true
+  end
+
   test "linear_graphql falls back to inspect for non-JSON payloads" do
     response =
       DynamicTool.execute(
@@ -561,13 +736,27 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     """
   end
 
-  defp human_review_gate_issue_response(state_name, state_id \\ "state-human-review") do
+  defp issue_state_and_branch_update_query do
+    """
+    mutation MoveIssueBranch($issueId: String!, $stateId: String!, $branchName: String!) {
+      issueUpdate(id: $issueId, input: {stateId: $stateId, branchName: $branchName}) {
+        success
+      }
+    }
+    """
+  end
+
+  defp human_review_gate_issue_response(
+         state_name,
+         state_id \\ "state-human-review",
+         branch_name \\ "feat/issue-123"
+       ) do
     %{
       "data" => %{
         "issue" => %{
           "id" => "issue-123",
           "identifier" => "SYM-123",
-          "branchName" => "feature/issue-123",
+          "branchName" => branch_name,
           "team" => %{
             "states" => %{
               "nodes" => [

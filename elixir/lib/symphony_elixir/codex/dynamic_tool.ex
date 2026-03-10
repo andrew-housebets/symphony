@@ -7,6 +7,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @linear_graphql_tool "linear_graphql"
   @human_review_state "human review"
+  @branch_enforced_states MapSet.new(["in progress", "rework", "human review", "merging"])
+  @conventional_branch_types ~w(build chore ci docs feat fix perf refactor revert style test)
+  @conventional_branch_regex Regex.compile!("^(?:#{Enum.join(@conventional_branch_types, "|")})\\/[a-z0-9][a-z0-9._-]*$")
+  @conventional_branch_prefixes Enum.map(@conventional_branch_types, &"#{&1}/")
   @human_review_gate_issue_query """
   query SymphonyHumanReviewGateIssue($issueId: String!) {
     issue(id: $issueId) {
@@ -142,6 +146,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
       {:ok, %{issue_id: issue_id, state_id: state_id}} ->
         with {:ok, issue_context} <- fetch_issue_context(issue_id, state_id, linear_client),
+             {:ok, issue_context} <- enforce_branch_name_gate(issue_context, extract_transition_branch_name(query, variables)),
              :ok <- enforce_human_review_pr_gate(issue_context, command_runner, command_cwd) do
           :ok
         end
@@ -193,6 +198,13 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       quoted_capture(query, ~r/\bstateId\s*:\s*"([^"]+)"/i) ||
       map_value(variables, "stateId") ||
       map_value(variables, "state_id")
+  end
+
+  defp extract_transition_branch_name(query, variables) when is_binary(query) and is_map(variables) do
+    variable_from_query(query, ~r/\bbranchName\s*:\s*\$(\w+)/i, variables) ||
+      quoted_capture(query, ~r/\bbranchName\s*:\s*"([^"]+)"/i) ||
+      map_value(variables, "branchName") ||
+      map_value(variables, "branch_name")
   end
 
   defp variable_from_query(query, regex, variables) when is_binary(query) and is_map(variables) do
@@ -310,6 +322,56 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
+  defp enforce_branch_name_gate(issue_context, transition_branch_name) when is_map(issue_context) do
+    if branch_name_required_for_state?(issue_context[:state_name]) do
+      branch_name = transition_branch_name || issue_context[:branch_name]
+
+      cond do
+        not is_binary(branch_name) or String.trim(branch_name) == "" ->
+          gate_error(
+            "Cannot transition issue state because a branch name is required. Set `branchName` first using a Conventional Commit prefix (for example `feat/...`, `fix/...`, `chore/...`, `docs/...`).",
+            %{
+              issue_id: issue_context[:issue_id],
+              identifier: issue_context[:identifier],
+              state: issue_context[:state_name],
+              required_prefixes: @conventional_branch_prefixes
+            }
+          )
+
+        not conventional_branch_name?(branch_name) ->
+          gate_error(
+            "Cannot transition issue state because the branch name does not follow conventional format. Use a Conventional Commit prefix (for example `feat/...`, `fix/...`, `chore/...`, `docs/...`).",
+            %{
+              issue_id: issue_context[:issue_id],
+              identifier: issue_context[:identifier],
+              state: issue_context[:state_name],
+              branch: branch_name,
+              required_prefixes: @conventional_branch_prefixes
+            }
+          )
+
+        true ->
+          {:ok, Map.put(issue_context, :branch_name, String.trim(branch_name))}
+      end
+    else
+      {:ok, issue_context}
+    end
+  end
+
+  defp branch_name_required_for_state?(state_name) when is_binary(state_name) do
+    MapSet.member?(@branch_enforced_states, normalize_state_name(state_name))
+  end
+
+  defp branch_name_required_for_state?(_state_name), do: false
+
+  defp conventional_branch_name?(branch_name) when is_binary(branch_name) do
+    branch_name
+    |> String.trim()
+    |> then(&Regex.match?(@conventional_branch_regex, &1))
+  end
+
+  defp conventional_branch_name?(_branch_name), do: false
+
   defp ensure_gh_auth(command_runner, command_cwd) do
     case command_runner.("gh", ["auth", "status"], cd: command_cwd) do
       {:ok, _} ->
@@ -389,7 +451,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
                  "view",
                  pr_number,
                  "--json",
-                 "number,url,state,headRepository,comments,reviews,commits,statusCheckRollup"
+                 "number,url,state,headRepository,headRepositoryOwner,comments,reviews,commits,statusCheckRollup"
                ],
                cd: command_cwd
              ),
@@ -578,7 +640,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp fetch_inline_review_comments(pr_details, pr, command_runner, command_cwd) do
-    repo = map_path(pr_details, ["headRepository", "nameWithOwner"])
+    repo = resolve_pr_repository(pr_details, pr)
     pr_number = map_path(pr, ["number"])
 
     cond do
@@ -617,6 +679,50 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         end
     end
   end
+
+  defp resolve_pr_repository(pr_details, pr) do
+    [
+      map_path(pr_details, ["headRepository", "nameWithOwner"]),
+      repo_from_owner_name(pr_details),
+      repo_from_pr_url(map_path(pr_details, ["url"])),
+      repo_from_pr_url(map_path(pr, ["url"]))
+    ]
+    |> Enum.find_value(&normalize_repository_name/1)
+  end
+
+  defp repo_from_owner_name(pr_details) when is_map(pr_details) do
+    owner_login = map_path(pr_details, ["headRepositoryOwner", "login"])
+    repo_name = map_path(pr_details, ["headRepository", "name"])
+
+    if is_binary(owner_login) and String.trim(owner_login) != "" and is_binary(repo_name) and String.trim(repo_name) != "" do
+      "#{String.trim(owner_login)}/#{String.trim(repo_name)}"
+    else
+      nil
+    end
+  end
+
+  defp repo_from_owner_name(_pr_details), do: nil
+
+  defp repo_from_pr_url(url) when is_binary(url) do
+    case Regex.run(~r|https://github\.com/([^/]+)/([^/]+)/pull/\d+|, String.trim(url), capture: :all_but_first) do
+      [owner, repo] -> "#{owner}/#{repo}"
+      _ -> nil
+    end
+  end
+
+  defp repo_from_pr_url(_url), do: nil
+
+  defp normalize_repository_name(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if Regex.match?(~r/^[^\/\s]+\/[^\/\s]+$/, trimmed) do
+      trimmed
+    else
+      nil
+    end
+  end
+
+  defp normalize_repository_name(_value), do: nil
 
   defp count_bot_comments_after(comments, head_commit_at) when is_list(comments) do
     Enum.count(comments, fn comment ->

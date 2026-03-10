@@ -541,6 +541,318 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot.rate_limit_bucket_model == "GPT-5.3-Codex-Spark"
   end
 
+  test "orchestrator merges partial rate-limit bucket updates into latest snapshot" do
+    issue_id = "issue-rate-limit-partial-merge"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-221B",
+      title: "Rate limit partial merge",
+      description: "Merge partial bucket updates into the latest snapshot",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-221B"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitPartialMergeOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    full_snapshot = %{
+      "limit_id" => "codex_bengalfox",
+      "limit_name" => "GPT-5.3-Codex-Spark",
+      "primary" => %{"used_percent" => 0.0, "window_minutes" => 300},
+      "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080},
+      "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil}
+    }
+
+    partial_update = %{
+      "primary" => %{"used_percent" => 12.5}
+    }
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "rate_limits" => full_snapshot
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "rate_limits" => partial_update
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.rate_limit_bucket_model == "GPT-5.3-Codex-Spark"
+    assert get_in(snapshot.rate_limits, ["limit_id"]) == "codex_bengalfox"
+    assert get_in(snapshot.rate_limits, ["primary", "used_percent"]) == 12.5
+    assert get_in(snapshot.rate_limits, ["secondary", "used_percent"]) == 0.0
+  end
+
+  test "orchestrator tracks multiple upstream rate-limit buckets in one run" do
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      codex_command: "codex app-server --model gpt-5.3-codex"
+    )
+
+    issue_id = "issue-rate-limit-multi-bucket"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-221C",
+      title: "Rate limit multi-bucket tracking",
+      description: "Track multiple upstream rate-limit buckets in one run",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-221C"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitMultiBucketOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "token_count",
+               "rate_limits" => %{
+                 "limit_id" => "codex",
+                 "primary" => %{"used_percent" => 91.0, "window_minutes" => 300},
+                 "secondary" => %{"used_percent" => 91.0, "window_minutes" => 10080}
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "token_count",
+               "rate_limits" => %{
+                 "limit_id" => "codex_bengalfox",
+                 "limit_name" => "GPT-5.3-Codex-Spark",
+                 "primary" => %{"used_percent" => 0.0, "window_minutes" => 300},
+                 "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080}
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.rate_limit_bucket_id == "codex"
+    assert get_in(snapshot.rate_limits, ["limit_id"]) == "codex"
+    assert length(snapshot.rate_limit_buckets) == 2
+
+    codex_bucket =
+      Enum.find(snapshot.rate_limit_buckets, fn bucket ->
+        bucket.bucket_id == "codex"
+      end)
+
+    spark_bucket =
+      Enum.find(snapshot.rate_limit_buckets, fn bucket ->
+        bucket.bucket_id == "codex_bengalfox"
+      end)
+
+    assert codex_bucket.selected == true
+    assert get_in(codex_bucket.rate_limits, ["primary", "used_percent"]) == 91.0
+    assert spark_bucket.latest == true
+    assert get_in(spark_bucket.rate_limits, ["primary", "used_percent"]) == 0.0
+  end
+
+  test "orchestrator ignores non-codex model identifiers from MCP wrapper events" do
+    issue_id = "issue-effective-model-mcp-wrapper"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-221A",
+      title: "Effective model wrapper filtering",
+      description: "Ignore tool-model strings from MCP wrapper events",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-221A"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :EffectiveModelMcpWrapperOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{"method" => "turn/started", "params" => %{"turn" => %{"id" => "turn-221a"}}},
+         model: "gpt-5.3-codex",
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/mcp_tool_call_begin",
+           "params" => %{
+             "msg" => %{
+               "model" => "context7",
+               "tool" => "search_docs"
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.effective_model == "gpt-5.3-codex"
+  end
+
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do
     issue_id = "issue-token-precedence"
 

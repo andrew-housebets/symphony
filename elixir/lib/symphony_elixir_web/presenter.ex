@@ -21,8 +21,10 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits,
+          rate_limit_buckets: Enum.map(Map.get(snapshot, :rate_limit_buckets, []), &rate_limit_bucket_payload/1),
           requested_model: Map.get(snapshot, :requested_model),
           effective_model: Map.get(snapshot, :effective_model),
+          rate_limit_bucket_id: Map.get(snapshot, :rate_limit_bucket_id),
           rate_limit_bucket_model: Map.get(snapshot, :rate_limit_bucket_model)
         }
 
@@ -126,6 +128,18 @@ defmodule SymphonyElixirWeb.Presenter do
       error: entry.error
     }
   end
+
+  defp rate_limit_bucket_payload(entry) when is_map(entry) do
+    %{
+      bucket_id: Map.get(entry, :bucket_id),
+      bucket_label: Map.get(entry, :bucket_label),
+      latest: Map.get(entry, :latest) == true,
+      selected: Map.get(entry, :selected) == true,
+      rate_limits: Map.get(entry, :rate_limits)
+    }
+  end
+
+  defp rate_limit_bucket_payload(_entry), do: %{}
 
   defp running_issue_payload(running) do
     %{

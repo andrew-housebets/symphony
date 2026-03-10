@@ -373,9 +373,33 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "rate_limits" => %{
+               "limit_id" => "codex_bengalfox",
+               "limit_name" => "GPT-5.3-Codex-Spark",
+               "primary" => %{"used_percent" => 0.0, "window_minutes" => 300, "resets_at" => 1_773_161_120},
+               "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
+               "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil},
+               "plan_type" => nil
+             },
+             "rate_limit_buckets" => [
+               %{
+                 "bucket_id" => "codex_bengalfox",
+                 "bucket_label" => "GPT-5.3-Codex-Spark",
+                 "latest" => true,
+                 "selected" => true,
+                 "rate_limits" => %{
+                   "limit_id" => "codex_bengalfox",
+                   "limit_name" => "GPT-5.3-Codex-Spark",
+                   "primary" => %{"used_percent" => 0.0, "window_minutes" => 300, "resets_at" => 1_773_161_120},
+                   "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
+                   "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil},
+                   "plan_type" => nil
+                 }
+               }
+             ],
              "requested_model" => "gpt-5.3-codex",
              "effective_model" => "gpt-5.3-codex",
+             "rate_limit_bucket_id" => "codex_bengalfox",
              "rate_limit_bucket_model" => "GPT-5.3-Codex-Spark"
            }
 
@@ -588,7 +612,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Codex update"
     assert html =~ "Configured model:"
     assert html =~ "gpt-5.3-codex"
-    assert html =~ "Rate-limit bucket:"
+    assert html =~ "Selected upstream bucket label:"
+    assert html =~ "Selected upstream bucket id:"
+    assert html =~ "bucket labels are upstream quota tiers"
+    assert html =~ "Bucket ID"
+    assert html =~ "Primary window"
     assert html =~ "GPT-5.3-Codex-Spark"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
@@ -754,9 +782,33 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}},
+      rate_limits: %{
+        "limit_id" => "codex_bengalfox",
+        "limit_name" => "GPT-5.3-Codex-Spark",
+        "primary" => %{"used_percent" => 0.0, "window_minutes" => 300, "resets_at" => 1_773_161_120},
+        "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
+        "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil},
+        "plan_type" => nil
+      },
+      rate_limit_buckets: [
+        %{
+          bucket_id: "codex_bengalfox",
+          bucket_label: "GPT-5.3-Codex-Spark",
+          latest: true,
+          selected: true,
+          rate_limits: %{
+            "limit_id" => "codex_bengalfox",
+            "limit_name" => "GPT-5.3-Codex-Spark",
+            "primary" => %{"used_percent" => 0.0, "window_minutes" => 300, "resets_at" => 1_773_161_120},
+            "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
+            "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil},
+            "plan_type" => nil
+          }
+        }
+      ],
       requested_model: "gpt-5.3-codex",
       effective_model: "gpt-5.3-codex",
+      rate_limit_bucket_id: "codex_bengalfox",
       rate_limit_bucket_model: "GPT-5.3-Codex-Spark"
     }
   end

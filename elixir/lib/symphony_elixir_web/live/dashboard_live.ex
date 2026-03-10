@@ -111,7 +111,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <div>
               <h2 class="section-title">Rate limits</h2>
               <p class="section-copy">
-                Configured and runtime-reported model identity, alongside the latest upstream rate-limit snapshot.
+                Configured/runtime model identity plus upstream quota-bucket metadata from the latest rate-limit snapshot.
               </p>
             </div>
           </div>
@@ -123,10 +123,45 @@ defmodule SymphonyElixirWeb.DashboardLive do
             Runtime-reported model: <span class="mono"><%= display_model(@payload.effective_model) %></span>
           </p>
           <p class="section-copy">
-            Rate-limit bucket: <span class="mono"><%= display_model(@payload.rate_limit_bucket_model) %></span>
+            Selected upstream bucket id: <span class="mono"><%= display_model(@payload.rate_limit_bucket_id) %></span>
+          </p>
+          <p class="section-copy">
+            Selected upstream bucket label: <span class="mono"><%= display_model(@payload.rate_limit_bucket_model) %></span>
+          </p>
+          <p :if={bucket_differs_from_models?(@payload)} class="section-copy">
+            Note: bucket labels are upstream quota tiers and can differ from model IDs.
           </p>
 
-          <pre class="code-panel"><%= pretty_value(@payload.rate_limits) %></pre>
+          <%= if rate_limit_rows(@payload) == [] do %>
+            <p class="empty-state">No rate-limit buckets reported yet.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 980px;">
+                <thead>
+                  <tr>
+                    <th>Bucket ID</th>
+                    <th>Bucket label</th>
+                    <th>Primary window</th>
+                    <th>Secondary window</th>
+                    <th>Credits</th>
+                    <th>Plan</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={row <- rate_limit_rows(@payload)}>
+                    <td class="mono"><%= row.bucket_id %></td>
+                    <td class="mono"><%= row.bucket_label %></td>
+                    <td class="mono"><%= row.primary %></td>
+                    <td class="mono"><%= row.secondary %></td>
+                    <td><%= row.credits %></td>
+                    <td><%= row.plan_type %></td>
+                    <td><%= row.status %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">
@@ -377,10 +412,168 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
   end
 
-  defp pretty_value(nil), do: "n/a"
-  defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
-
   defp display_model(nil), do: "n/a"
   defp display_model(value) when is_binary(value), do: value
   defp display_model(value), do: to_string(value)
+
+  defp rate_limit_rows(payload) when is_map(payload) do
+    rows =
+      payload
+      |> Map.get(:rate_limit_buckets, [])
+      |> List.wrap()
+      |> Enum.map(&rate_limit_row_from_entry/1)
+      |> Enum.reject(&is_nil/1)
+
+    if rows == [] do
+      case fallback_rate_limit_row(payload) do
+        nil -> []
+        row -> [row]
+      end
+    else
+      rows
+    end
+  end
+
+  defp rate_limit_rows(_payload), do: []
+
+  defp fallback_rate_limit_row(payload) when is_map(payload) do
+    case Map.get(payload, :rate_limits) do
+      %{} = rate_limits ->
+        rate_limit_row(
+          Map.get(payload, :rate_limit_bucket_id),
+          Map.get(payload, :rate_limit_bucket_model),
+          rate_limits,
+          true,
+          true
+        )
+
+      _ ->
+        nil
+    end
+  end
+
+  defp fallback_rate_limit_row(_payload), do: nil
+
+  defp rate_limit_row_from_entry(entry) when is_map(entry) do
+    rate_limits = Map.get(entry, :rate_limits)
+
+    if is_map(rate_limits) do
+      rate_limit_row(
+        Map.get(entry, :bucket_id),
+        Map.get(entry, :bucket_label),
+        rate_limits,
+        Map.get(entry, :selected) == true,
+        Map.get(entry, :latest) == true
+      )
+    end
+  end
+
+  defp rate_limit_row_from_entry(_entry), do: nil
+
+  defp rate_limit_row(bucket_id, bucket_label, rate_limits, selected?, latest?) when is_map(rate_limits) do
+    %{
+      bucket_id: display_model(bucket_id),
+      bucket_label: display_model(bucket_label),
+      primary: format_rate_limit_window(rate_limit_map_value(rate_limits, ["primary", :primary])),
+      secondary: format_rate_limit_window(rate_limit_map_value(rate_limits, ["secondary", :secondary])),
+      credits: format_rate_limit_credits(rate_limit_map_value(rate_limits, ["credits", :credits])),
+      plan_type: format_rate_limit_plan(rate_limits),
+      status: format_rate_limit_status(selected?, latest?)
+    }
+  end
+
+  defp rate_limit_row(_bucket_id, _bucket_label, _rate_limits, _selected?, _latest?), do: nil
+
+  defp format_rate_limit_status(true, true), do: "selected, latest"
+  defp format_rate_limit_status(true, false), do: "selected"
+  defp format_rate_limit_status(false, true), do: "latest"
+  defp format_rate_limit_status(false, false), do: "tracked"
+
+  defp format_rate_limit_plan(rate_limits) when is_map(rate_limits) do
+    case rate_limit_map_value(rate_limits, ["plan_type", :plan_type, "planType", :planType]) do
+      value when is_binary(value) ->
+        trimmed = String.trim(value)
+        if trimmed == "", do: "n/a", else: trimmed
+
+      nil ->
+        "n/a"
+
+      other ->
+        to_string(other)
+    end
+  end
+
+  defp format_rate_limit_plan(_rate_limits), do: "n/a"
+
+  defp format_rate_limit_window(window) when is_map(window) do
+    used_percent = rate_limit_map_value(window, ["used_percent", :used_percent, "usedPercent", :usedPercent])
+    window_minutes = rate_limit_map_value(window, ["window_minutes", :window_minutes, "windowDurationMins", :windowDurationMins])
+    resets_at = rate_limit_map_value(window, ["resets_at", :resets_at, "resetsAt", :resetsAt])
+
+    used_text =
+      cond do
+        is_integer(used_percent) -> "#{used_percent}%"
+        is_float(used_percent) -> "#{Float.round(used_percent, 1)}%"
+        true -> "n/a"
+      end
+
+    window_text = if is_integer(window_minutes), do: "#{window_minutes}m", else: "n/a"
+    reset_text = format_rate_limit_reset(resets_at)
+    "#{used_text} · #{window_text} · #{reset_text}"
+  end
+
+  defp format_rate_limit_window(_window), do: "n/a"
+
+  defp format_rate_limit_reset(unix_seconds) when is_integer(unix_seconds) do
+    case DateTime.from_unix(unix_seconds) do
+      {:ok, datetime} -> "resets #{Calendar.strftime(datetime, "%Y-%m-%d %H:%M UTC")}"
+      _ -> "reset n/a"
+    end
+  end
+
+  defp format_rate_limit_reset(_value), do: "reset n/a"
+
+  defp format_rate_limit_credits(credits) when is_map(credits) do
+    unlimited = rate_limit_map_value(credits, ["unlimited", :unlimited]) == true
+    has_credits = rate_limit_map_value(credits, ["has_credits", :has_credits, "hasCredits", :hasCredits]) == true
+    balance = rate_limit_map_value(credits, ["balance", :balance])
+
+    cond do
+      unlimited ->
+        "unlimited"
+
+      has_credits and is_number(balance) ->
+        "balance #{format_number(balance)}"
+
+      has_credits ->
+        "available"
+
+      true ->
+        "none"
+    end
+  end
+
+  defp format_rate_limit_credits(_credits), do: "n/a"
+
+  defp format_number(value) when is_integer(value), do: Integer.to_string(value)
+  defp format_number(value) when is_float(value), do: Float.to_string(Float.round(value, 2))
+  defp format_number(value), do: to_string(value)
+
+  defp rate_limit_map_value(payload, keys) when is_map(payload) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      if Map.has_key?(payload, key), do: Map.get(payload, key)
+    end)
+  end
+
+  defp rate_limit_map_value(_payload, _keys), do: nil
+
+  defp bucket_differs_from_models?(payload) when is_map(payload) do
+    bucket = Map.get(payload, :rate_limit_bucket_model)
+    requested = Map.get(payload, :requested_model)
+    effective = Map.get(payload, :effective_model)
+
+    is_binary(bucket) and String.trim(bucket) != "" and bucket != requested and bucket != effective
+  end
+
+  defp bucket_differs_from_models?(_payload), do: false
 end

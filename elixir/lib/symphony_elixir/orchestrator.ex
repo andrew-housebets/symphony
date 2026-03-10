@@ -39,6 +39,8 @@ defmodule SymphonyElixir.Orchestrator do
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
+      codex_rate_limit_buckets: %{},
+      codex_rate_limit_latest_bucket_key: nil,
       codex_effective_model: nil
     ]
   end
@@ -60,6 +62,8 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil,
+      codex_rate_limit_buckets: %{},
+      codex_rate_limit_latest_bucket_key: nil,
       codex_effective_model: nil
     }
 
@@ -1017,20 +1021,7 @@ defmodule SymphonyElixir.Orchestrator do
       end)
 
     {:reply,
-     %{
-       running: running,
-       retrying: retrying,
-       codex_totals: state.codex_totals,
-       rate_limits: Map.get(state, :codex_rate_limits),
-       requested_model: requested_model_from_command(Config.codex_command()),
-       effective_model: Map.get(state, :codex_effective_model),
-       rate_limit_bucket_model: rate_limit_bucket_model(Map.get(state, :codex_rate_limits)),
-       polling: %{
-         checking?: state.poll_check_in_progress == true,
-         next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
-         poll_interval_ms: state.poll_interval_ms
-       }
-     }, state}
+     snapshot_payload(state, running, retrying, now_ms), state}
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -1049,6 +1040,31 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp snapshot_payload(state, running, retrying, now_ms) do
+    requested_model = requested_model_from_command(Config.codex_command())
+    effective_model = Map.get(state, :codex_effective_model)
+
+    {rate_limit_buckets, selected_rate_limits} =
+      snapshot_rate_limit_buckets(state, requested_model, effective_model)
+
+    %{
+      running: running,
+      retrying: retrying,
+      codex_totals: state.codex_totals,
+      rate_limits: selected_rate_limits,
+      rate_limit_buckets: rate_limit_buckets,
+      requested_model: requested_model,
+      effective_model: effective_model,
+      rate_limit_bucket_id: rate_limit_bucket_id(selected_rate_limits),
+      rate_limit_bucket_model: rate_limit_bucket_model(selected_rate_limits),
+      polling: %{
+        checking?: state.poll_check_in_progress == true,
+        next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
+        poll_interval_ms: state.poll_interval_ms
+      }
+    }
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
@@ -1243,7 +1259,19 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_codex_rate_limits(%State{} = state, update) when is_map(update) do
     case extract_rate_limits(update) do
       %{} = rate_limits ->
-        %{state | codex_rate_limits: rate_limits}
+        {rate_limit_buckets, latest_bucket_key} =
+          merge_rate_limit_bucket(
+            Map.get(state, :codex_rate_limit_buckets, %{}),
+            Map.get(state, :codex_rate_limit_latest_bucket_key),
+            rate_limits
+          )
+
+        %{
+          state
+          | codex_rate_limits: merge_rate_limits(Map.get(state, :codex_rate_limits), rate_limits),
+            codex_rate_limit_buckets: rate_limit_buckets,
+            codex_rate_limit_latest_bucket_key: latest_bucket_key
+        }
 
       _ ->
         state
@@ -1347,7 +1375,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_rate_limits(update) do
-    rate_limits_from_payload(update[:rate_limits]) ||
+    rate_limits_from_payload(map_at_path(update, ["params", "rateLimits"])) ||
+      rate_limits_from_payload(map_at_path(update, [:params, :rateLimits])) ||
+      rate_limits_from_payload(update[:rate_limits]) ||
       rate_limits_from_payload(Map.get(update, "rate_limits")) ||
       rate_limits_from_payload(Map.get(update, :rate_limits)) ||
       rate_limits_from_payload(update[:payload]) ||
@@ -1362,10 +1392,54 @@ defmodule SymphonyElixir.Orchestrator do
       model_identifier_from_payload(update[:model]) ||
       model_identifier_from_payload(Map.get(update, "model")) ||
       model_identifier_from_payload(Map.get(update, :model)) ||
-      model_identifier_from_payload(update[:payload]) ||
-      model_identifier_from_payload(Map.get(update, "payload")) ||
-      model_identifier_from_payload(update)
+      payload_effective_model(update[:payload]) ||
+      payload_effective_model(Map.get(update, "payload"))
   end
+
+  defp payload_effective_model(payload) when is_map(payload) do
+    method = Map.get(payload, "method") || Map.get(payload, :method)
+
+    if effective_model_method?(method) do
+      payload_effective_model_from_paths(payload)
+    else
+      nil
+    end
+  end
+
+  defp payload_effective_model(_payload), do: nil
+
+  defp payload_effective_model_from_paths(payload) when is_map(payload) do
+    model_paths = [
+      ["model"],
+      [:model],
+      ["params", "model"],
+      [:params, :model],
+      ["params", "turn", "model"],
+      [:params, :turn, :model],
+      ["payload", "model"],
+      [:payload, :model],
+      ["params", "msg", "model"],
+      [:params, :msg, :model],
+      ["params", "msg", "payload", "model"],
+      [:params, :msg, :payload, :model]
+    ]
+
+    Enum.find_value(model_paths, fn path ->
+      payload |> map_at_path(path) |> model_identifier_from_payload()
+    end)
+  end
+
+  defp payload_effective_model_from_paths(_payload), do: nil
+
+  defp effective_model_method?(method) when is_binary(method) do
+    String.starts_with?(method, "turn/") or
+      String.starts_with?(method, "thread/") or
+      method == "session/started" or
+      method == "session/updated" or
+      method == "codex/event/token_count"
+  end
+
+  defp effective_model_method?(_method), do: false
 
   defp absolute_token_usage_from_payload(payload) when is_map(payload) do
     absolute_paths = [
@@ -1401,13 +1475,17 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_completed_usage_from_payload(_payload), do: nil
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") ||
+        Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") ||
+        Map.get(payload, :rateLimits)
 
     cond do
-      rate_limits_map?(direct) ->
+      rate_limits_candidate_map?(direct) ->
         direct
 
-      rate_limits_map?(payload) ->
+      rate_limits_candidate_map?(payload) ->
         payload
 
       true ->
@@ -1450,11 +1528,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp rate_limits_map?(payload) when is_map(payload) do
-    limit_id =
-      Map.get(payload, "limit_id") ||
-        Map.get(payload, :limit_id) ||
-        Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
+    has_identifier =
+      !is_nil(
+        map_value(payload, [
+          "limit_id",
+          :limit_id,
+          "limitId",
+          :limitId,
+          "limit_name",
+          :limit_name,
+          "limitName",
+          :limitName
+        ])
+      )
 
     has_buckets =
       Enum.any?(
@@ -1462,16 +1548,238 @@ defmodule SymphonyElixir.Orchestrator do
         &Map.has_key?(payload, &1)
       )
 
-    !is_nil(limit_id) and has_buckets
+    has_identifier and has_buckets
   end
 
   defp rate_limits_map?(_payload), do: false
 
+  defp rate_limits_partial_map?(payload) when is_map(payload) do
+    Enum.any?(
+      ["primary", :primary, "secondary", :secondary, "credits", :credits],
+      &Map.has_key?(payload, &1)
+    )
+  end
+
+  defp rate_limits_partial_map?(_payload), do: false
+
+  defp rate_limits_candidate_map?(payload) do
+    rate_limits_map?(payload) || rate_limits_partial_map?(payload)
+  end
+
   defp rate_limit_bucket_model(rate_limits) when is_map(rate_limits) do
-    model_identifier_from_payload(Map.get(rate_limits, "limit_name") || Map.get(rate_limits, :limit_name))
+    model_identifier_from_payload(
+      map_value(rate_limits, ["limit_name", :limit_name, "limitName", :limitName])
+    )
   end
 
   defp rate_limit_bucket_model(_rate_limits), do: nil
+
+  defp rate_limit_bucket_id(rate_limits) when is_map(rate_limits) do
+    map_value(rate_limits, ["limit_id", :limit_id, "limitId", :limitId])
+    |> normalize_bucket_key()
+  end
+
+  defp rate_limit_bucket_id(_rate_limits), do: nil
+
+  defp rate_limit_bucket_key(rate_limits) when is_map(rate_limits) do
+    rate_limit_bucket_id(rate_limits) ||
+      map_value(rate_limits, ["limit_name", :limit_name, "limitName", :limitName])
+      |> normalize_bucket_key()
+  end
+
+  defp rate_limit_bucket_key(_rate_limits), do: nil
+
+  defp normalize_bucket_key(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_bucket_key(nil), do: nil
+  defp normalize_bucket_key(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_bucket_key()
+  defp normalize_bucket_key(value) when is_integer(value), do: Integer.to_string(value)
+  defp normalize_bucket_key(_value), do: nil
+
+  defp snapshot_rate_limit_buckets(%State{} = state, requested_model, effective_model) do
+    buckets = stored_or_legacy_rate_limit_buckets(state)
+    latest_bucket_key = Map.get(state, :codex_rate_limit_latest_bucket_key)
+
+    selected_bucket_key =
+      select_rate_limit_bucket_key(buckets, latest_bucket_key, requested_model, effective_model)
+
+    selected_rate_limits = if not is_nil(selected_bucket_key), do: Map.get(buckets, selected_bucket_key)
+
+    entries =
+      buckets
+      |> Enum.map(fn {bucket_key, rate_limits} ->
+        bucket_id = rate_limit_bucket_id(rate_limits) || bucket_key
+
+        %{
+          bucket_id: bucket_id,
+          bucket_label: rate_limit_bucket_model(rate_limits),
+          latest: bucket_key == latest_bucket_key,
+          selected: bucket_key == selected_bucket_key,
+          rate_limits: rate_limits
+        }
+      end)
+      |> Enum.sort_by(fn entry ->
+        {not entry.selected, not entry.latest, to_string(entry.bucket_id || entry.bucket_label || "")}
+      end)
+
+    {entries, selected_rate_limits || Map.get(state, :codex_rate_limits)}
+  end
+
+  defp stored_or_legacy_rate_limit_buckets(%State{} = state) do
+    buckets = Map.get(state, :codex_rate_limit_buckets, %{})
+
+    cond do
+      is_map(buckets) and map_size(buckets) > 0 ->
+        buckets
+
+      is_map(Map.get(state, :codex_rate_limits)) ->
+        rate_limits = Map.get(state, :codex_rate_limits)
+        bucket_key = rate_limit_bucket_key(rate_limits) || "__default__"
+        %{bucket_key => rate_limits}
+
+      true ->
+        %{}
+    end
+  end
+
+  defp select_rate_limit_bucket_key(buckets, latest_bucket_key, requested_model, effective_model)
+       when is_map(buckets) do
+    entries =
+      buckets
+      |> Map.to_list()
+      |> Enum.sort_by(fn {bucket_key, _rate_limits} -> to_string(bucket_key) end)
+
+    by_effective_model =
+      Enum.find(entries, fn {_bucket_key, rate_limits} ->
+        bucket_matches_model?(rate_limits, effective_model)
+      end)
+
+    by_requested_model =
+      Enum.find(entries, fn {_bucket_key, rate_limits} ->
+        bucket_matches_model?(rate_limits, requested_model)
+      end)
+
+    by_highest_usage =
+      Enum.max_by(entries, fn {_bucket_key, rate_limits} -> bucket_primary_used_percent(rate_limits) end, fn -> nil end)
+
+    by_latest_bucket =
+      if not is_nil(latest_bucket_key) do
+        Enum.find(entries, fn {bucket_key, _rate_limits} -> bucket_key == latest_bucket_key end)
+      end
+
+    fallback = Enum.min_by(entries, fn {bucket_key, _rate_limits} -> to_string(bucket_key) end, fn -> nil end)
+
+    case by_effective_model || by_requested_model || preferred_usage_bucket(by_highest_usage) || by_latest_bucket || fallback do
+      {bucket_key, _rate_limits} -> bucket_key
+      _ -> nil
+    end
+  end
+
+  defp select_rate_limit_bucket_key(_buckets, _latest_bucket_key, _requested_model, _effective_model), do: nil
+
+  defp bucket_matches_model?(rate_limits, model) when is_map(rate_limits) and is_binary(model) do
+    normalized_model = String.downcase(String.trim(model))
+
+    normalized_model != "" and
+      Enum.any?(
+        [rate_limit_bucket_model(rate_limits), rate_limit_bucket_id(rate_limits)],
+        fn
+          value when is_binary(value) ->
+            normalized_value = String.downcase(String.trim(value))
+
+            normalized_value != "" and
+              (normalized_value == normalized_model ||
+                 String.contains?(normalized_model, normalized_value) ||
+                 String.contains?(normalized_value, normalized_model))
+
+          _value -> false
+        end
+      )
+  end
+
+  defp bucket_matches_model?(_rate_limits, _model), do: false
+
+  defp bucket_primary_used_percent(rate_limits) when is_map(rate_limits) do
+    primary =
+      map_value(rate_limits, ["primary", :primary])
+
+    used_percent =
+      if is_map(primary) do
+        map_value(primary, ["used_percent", :used_percent, "usedPercent", :usedPercent])
+      end
+
+    cond do
+      is_integer(used_percent) -> used_percent * 1.0
+      is_float(used_percent) -> used_percent
+      true -> 0.0
+    end
+  end
+
+  defp bucket_primary_used_percent(_rate_limits), do: 0.0
+
+  defp preferred_usage_bucket({_bucket_key, rate_limits} = entry) when is_map(rate_limits) do
+    if bucket_primary_used_percent(rate_limits) > 0.0, do: entry
+  end
+
+  defp preferred_usage_bucket(_entry), do: nil
+
+  defp merge_rate_limit_bucket(existing_buckets, latest_bucket_key, incoming_rate_limits)
+       when is_map(existing_buckets) and is_map(incoming_rate_limits) do
+    provisional_bucket_key =
+      rate_limit_bucket_key(incoming_rate_limits) ||
+        latest_bucket_key ||
+        singleton_bucket_key(existing_buckets) ||
+        "__default__"
+
+    provisional_bucket =
+      existing_buckets
+      |> Map.get(provisional_bucket_key, %{})
+      |> merge_rate_limits(incoming_rate_limits)
+
+    final_bucket_key = rate_limit_bucket_key(provisional_bucket) || provisional_bucket_key
+
+    migrated =
+      if final_bucket_key != provisional_bucket_key do
+        Map.delete(existing_buckets, provisional_bucket_key)
+      else
+        existing_buckets
+      end
+
+    merged_bucket =
+      migrated
+      |> Map.get(final_bucket_key, %{})
+      |> merge_rate_limits(provisional_bucket)
+
+    {Map.put(migrated, final_bucket_key, merged_bucket), final_bucket_key}
+  end
+
+  defp merge_rate_limit_bucket(_existing_buckets, _latest_bucket_key, _incoming_rate_limits), do: {%{}, nil}
+
+  defp singleton_bucket_key(buckets) when is_map(buckets) do
+    case Map.keys(buckets) do
+      [bucket_key] -> bucket_key
+      _ -> nil
+    end
+  end
+
+  defp singleton_bucket_key(_buckets), do: nil
+
+  defp merge_rate_limits(nil, incoming) when is_map(incoming), do: incoming
+
+  defp merge_rate_limits(existing, incoming) when is_map(existing) and is_map(incoming) do
+    Map.merge(existing, incoming, fn _key, left, right ->
+      if is_map(left) and is_map(right) do
+        merge_rate_limits(left, right)
+      else
+        right
+      end
+    end)
+  end
+
+  defp merge_rate_limits(_existing, incoming), do: incoming
 
   defp model_identifier_from_payload(payload) when is_binary(payload) do
     trimmed = String.trim(payload)
@@ -1531,6 +1839,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp requested_model_from_command(_command), do: nil
+
+  defp map_value(payload, keys) when is_map(payload) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      if Map.has_key?(payload, key), do: Map.get(payload, key)
+    end)
+  end
+
+  defp map_value(_payload, _keys), do: nil
 
   defp explicit_map_at_paths(payload, paths) when is_map(payload) and is_list(paths) do
     Enum.find_value(paths, fn path ->

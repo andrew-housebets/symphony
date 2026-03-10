@@ -74,12 +74,18 @@ defmodule SymphonyElixir.SessionLog do
   end
 
   @doc """
-  Resets (truncates) the log file for an issue. Called when a session restarts.
+  Appends a session separator to the log file. Called when a session restarts.
+  Previous session logs are preserved (append-only).
   """
   @spec reset(String.t()) :: :ok
   def reset(issue_identifier) when is_binary(issue_identifier) do
     path = log_path(issue_identifier)
-    File.rm(path)
+
+    if File.exists?(path) do
+      separator = Jason.encode!(%{at: DateTime.to_iso8601(DateTime.utc_now()), text: "--- new session ---"}) <> "\n"
+      File.write(path, separator, [:append])
+    end
+
     :ok
   end
 

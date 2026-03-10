@@ -794,20 +794,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp format_completed_at(%DateTime{} = dt), do: Calendar.strftime(dt, "%H:%M:%S")
   defp format_completed_at(_), do: "n/a"
 
-  defp format_stdout_entry(%{at: at, text: text}) when is_binary(text) do
-    case at do
-      ts when is_binary(ts) and ts != "" -> "[#{ts}] #{text}"
-      _ -> text
-    end
-  end
-
-  defp format_stdout_entry(%{"at" => at, "text" => text}) when is_binary(text) do
-    case at do
-      ts when is_binary(ts) and ts != "" -> "[#{ts}] #{text}"
-      _ -> text
-    end
-  end
-
+  defp format_stdout_entry(%{text: text}) when is_binary(text), do: text
+  defp format_stdout_entry(%{"text" => text}) when is_binary(text), do: text
   defp format_stdout_entry(_), do: ""
 
   # ── Badge/class helpers ────────────────────────────────────────────

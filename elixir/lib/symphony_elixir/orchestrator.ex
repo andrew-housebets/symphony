@@ -1198,7 +1198,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
-    stdout_line_count = append_stdout_to_file(running_entry, update)
+    {stdout_line_count, stdout_buffer} = append_stdout_to_file(running_entry, update)
 
     {
       Map.merge(running_entry, %{
@@ -1214,7 +1214,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update),
-        stdout_line_count: stdout_line_count
+        stdout_line_count: stdout_line_count,
+        stdout_buffer: stdout_buffer
       }),
       token_delta
     }
@@ -1267,37 +1268,151 @@ defmodule SymphonyElixir.Orchestrator do
   # Events to skip from the session stdout trace
   @stdout_skip_events [:session_started, :startup_failed]
 
+  # Streaming delta notification methods — these get buffered and concatenated
+  # so the log reads like continuous model output (similar to Codex CLI).
+  @streaming_delta_methods ~w(
+    item/agentMessage/delta
+    item/plan/delta
+    item/reasoning/summaryTextDelta
+    item/reasoning/textDelta
+    item/commandExecution/outputDelta
+    item/fileChange/outputDelta
+    agent_message_delta
+    agent_message_content_delta
+    agent_reasoning_delta
+    reasoning_content_delta
+  )
+
+  # Notification methods that are pure noise for the session log — skip entirely.
+  @skip_notification_methods ~w(
+    thread/tokenUsage/updated
+    account/rateLimits/updated
+    account/updated
+    account/chatgptAuthTokens/refresh
+  )
+
   defp append_stdout_to_file(running_entry, update) do
     current_count = Map.get(running_entry, :stdout_line_count, 0)
+    buffer = Map.get(running_entry, :stdout_buffer, "")
+    identifier = running_entry.identifier
 
-    case stdout_text_from_update(update) do
-      nil ->
-        current_count
+    case classify_update(update) do
+      :skip ->
+        {current_count, buffer}
 
-      text ->
-        identifier = running_entry.identifier
-        timestamp = update_timestamp(update)
+      {:streaming_delta, delta_text} ->
+        # Accumulate raw delta text in the buffer — don't write a line yet
+        {current_count, buffer <> delta_text}
 
-        case SessionLog.append(identifier, timestamp, text) do
-          {:ok, count} -> count
-          :error -> current_count
+      {:log_line, text} ->
+        # Flush any buffered streaming text first, then write the event line
+        count = flush_buffer(identifier, buffer, current_count)
+        count = write_log_line(identifier, update, text, count)
+        {count, ""}
+    end
+  end
+
+  defp classify_update(%{event: event}) when event in @stdout_skip_events, do: :skip
+
+  defp classify_update(%{event: :notification, payload: payload}) when is_map(payload) do
+    method =
+      Map.get(payload, "method") || Map.get(payload, :method) ||
+        Map.get(payload, "type") || Map.get(payload, :type)
+
+    cond do
+      method in @skip_notification_methods ->
+        :skip
+
+      method in @streaming_delta_methods ->
+        case extract_raw_delta(payload) do
+          nil -> :skip
+          text -> {:streaming_delta, text}
+        end
+
+      true ->
+        message = %{event: :notification, message: payload}
+        text = StatusDashboard.humanize_codex_message(message)
+
+        case sanitize_session_stdout_text(text) do
+          nil -> :skip
+          sanitized -> {:log_line, sanitized}
         end
     end
   end
 
-  defp stdout_text_from_update(%{event: event}) when event in @stdout_skip_events, do: nil
-
-  defp stdout_text_from_update(%{event: :malformed} = update) do
-    sanitize_session_stdout_text(update[:payload] || update[:raw])
+  defp classify_update(%{event: :malformed} = update) do
+    case sanitize_session_stdout_text(update[:payload] || update[:raw]) do
+      nil -> :skip
+      text -> {:log_line, text}
+    end
   end
 
-  defp stdout_text_from_update(%{event: event} = update) do
+  defp classify_update(%{event: event} = update) do
     message = summarize_codex_update(update)
     text = StatusDashboard.humanize_codex_message(message)
 
     case sanitize_session_stdout_text(text) do
-      nil -> nil
-      sanitized -> "[#{event}] #{sanitized}"
+      nil -> :skip
+      sanitized -> {:log_line, "[#{event}] #{sanitized}"}
+    end
+  end
+
+  defp classify_update(_), do: :skip
+
+  # Extract raw delta text from streaming notification payloads
+  defp extract_raw_delta(payload) do
+    delta =
+      get_nested(payload, ["params", "delta"]) ||
+        get_nested(payload, ["params", "textDelta"]) ||
+        get_nested(payload, ["params", "outputDelta"]) ||
+        get_nested(payload, ["params", "summaryText"]) ||
+        get_nested(payload, ["params", "text"]) ||
+        get_nested(payload, ["params", "msg", "delta"]) ||
+        get_nested(payload, ["params", "msg", "textDelta"]) ||
+        get_nested(payload, ["params", "msg", "outputDelta"]) ||
+        get_nested(payload, ["params", "msg", "payload", "delta"]) ||
+        get_nested(payload, ["params", "msg", "payload", "textDelta"]) ||
+        get_nested(payload, ["params", "msg", "payload", "outputDelta"]) ||
+        get_nested(payload, ["params", "content"]) ||
+        get_nested(payload, ["params", "msg", "content"])
+
+    if is_binary(delta) and delta != "", do: delta, else: nil
+  end
+
+  defp get_nested(map, [key | rest]) when is_map(map) do
+    value = Map.get(map, key) || Map.get(map, String.to_existing_atom(key))
+    case rest do
+      [] -> value
+      _ when is_map(value) -> get_nested(value, rest)
+      _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp get_nested(_, _), do: nil
+
+  defp flush_buffer(_identifier, "", count), do: count
+
+  defp flush_buffer(identifier, buffer, count) do
+    text = sanitize_session_stdout_text(buffer)
+
+    if text do
+      case SessionLog.append(identifier, DateTime.utc_now(), text) do
+        {:ok, new_count} -> new_count
+        :error -> count
+      end
+    else
+      count
+    end
+  end
+
+  defp write_log_line(identifier, update, text, count) do
+    timestamp = update_timestamp(update)
+
+    case SessionLog.append(identifier, timestamp, text) do
+      {:ok, new_count} -> new_count
+      :error -> count
     end
   end
 
@@ -1336,7 +1451,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp pop_running_entry(state, issue_id) do
-    {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
+    running_entry = Map.get(state.running, issue_id)
+
+    # Flush any remaining stdout buffer before removing the entry
+    if running_entry do
+      buffer = Map.get(running_entry, :stdout_buffer, "")
+      if buffer != "", do: flush_buffer(running_entry.identifier, buffer, 0)
+    end
+
+    {running_entry, %{state | running: Map.delete(state.running, issue_id)}}
   end
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do

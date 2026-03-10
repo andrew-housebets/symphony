@@ -46,7 +46,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply,
      socket
      |> assign(:payload, load_payload())
-     |> assign(:now, DateTime.utc_now())}
+     |> assign(:now, DateTime.utc_now())
+     |> refresh_open_stdout()}
   end
 
   @impl true
@@ -54,7 +55,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
     {:noreply,
      socket
      |> assign(:payload, load_payload())
-     |> assign(:now, DateTime.utc_now())}
+     |> assign(:now, DateTime.utc_now())
+     |> refresh_open_stdout()}
   end
 
   @impl true
@@ -672,15 +674,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp fetch_stdout(issue_identifier) do
-    case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
-      {:ok, %{logs: %{codex_session_logs: logs}}} when is_list(logs) ->
-        logs
-        |> Enum.map(&format_stdout_entry/1)
-        |> Enum.reject(&(&1 == ""))
-        |> Enum.join("\n")
+    issue_identifier
+    |> SymphonyElixir.SessionLog.read_all()
+    |> Enum.map(&format_stdout_entry/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
+  end
 
-      _ ->
-        ""
+  defp refresh_open_stdout(socket) do
+    stdout_open = socket.assigns.stdout_open
+
+    if map_size(stdout_open) == 0 do
+      socket
+    else
+      refreshed =
+        Map.new(stdout_open, fn {identifier, _old} ->
+          {identifier, fetch_stdout(identifier)}
+        end)
+
+      assign(socket, :stdout_open, refreshed)
     end
   end
 

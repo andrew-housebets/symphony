@@ -41,6 +41,9 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+    writableRoots:
+      - ~/.docker/run
+    networkAccess: true
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

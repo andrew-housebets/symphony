@@ -723,7 +723,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert Config.codex_turn_sandbox_policy() == %{
              "type" => "workspaceWrite",
-             "writableRoots" => ["/tmp/workspace", "/tmp/cache"]
+             "writableRoots" => [
+               Path.expand(Path.join(System.tmp_dir!(), "symphony_workspaces")),
+               "/tmp/workspace",
+               "/tmp/cache"
+             ]
+           }
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_turn_sandbox_policy: %{type: "workspaceWrite"})
+
+    assert Config.codex_turn_sandbox_policy() == %{
+             "type" => "workspaceWrite",
+             "writableRoots" => [Path.expand(Path.join(System.tmp_dir!(), "symphony_workspaces"))]
+           }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_turn_sandbox_policy: %{type: "workspaceWrite", writableRoots: ["~/.docker/run"]}
+    )
+
+    assert Config.codex_turn_sandbox_policy() == %{
+             "type" => "workspaceWrite",
+             "writableRoots" => [
+               Path.expand(Path.join(System.tmp_dir!(), "symphony_workspaces")),
+               Path.expand(Path.join(System.user_home!(), ".docker/run"))
+             ]
            }
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ",")

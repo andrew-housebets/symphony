@@ -760,7 +760,7 @@ defmodule SymphonyElixir.Config do
         {:ok, default_codex_turn_sandbox_policy(workspace)}
 
       value when is_map(value) ->
-        {:ok, value}
+        {:ok, normalize_codex_turn_sandbox_policy(value, workspace)}
 
       value ->
         {:error, {:invalid_codex_turn_sandbox_policy, {:unsupported_value, value}}}
@@ -768,12 +768,7 @@ defmodule SymphonyElixir.Config do
   end
 
   defp default_codex_turn_sandbox_policy(workspace) do
-    writable_root =
-      if is_binary(workspace) and String.trim(workspace) != "" do
-        Path.expand(workspace)
-      else
-        Path.expand(workspace_root())
-      end
+    writable_root = sandbox_writable_root(workspace)
 
     %{
       "type" => "workspaceWrite",
@@ -783,6 +778,94 @@ defmodule SymphonyElixir.Config do
       "excludeTmpdirEnvVar" => false,
       "excludeSlashTmp" => false
     }
+  end
+
+  defp normalize_codex_turn_sandbox_policy(value, workspace) when is_map(value) do
+    normalized = normalize_keys(value)
+
+    if workspace_write_turn_sandbox_policy?(normalized) do
+      writable_root = sandbox_writable_root(workspace)
+
+      writable_roots =
+        normalized
+        |> Map.get("writableRoots")
+        |> normalize_writable_roots(writable_root)
+        |> prepend_writable_root(writable_root)
+
+      Map.put(normalized, "writableRoots", writable_roots)
+    else
+      normalized
+    end
+  end
+
+  defp workspace_write_turn_sandbox_policy?(%{"type" => type}) when is_binary(type) do
+    String.downcase(String.trim(type)) == "workspacewrite"
+  end
+
+  defp workspace_write_turn_sandbox_policy?(_value), do: false
+
+  defp normalize_writable_roots(roots, writable_root) when is_list(roots) do
+    roots
+    |> Enum.reduce([], fn root, acc ->
+      case normalize_writable_root(root, writable_root) do
+        nil -> acc
+        normalized -> [normalized | acc]
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.uniq()
+  end
+
+  defp normalize_writable_roots(_roots, _writable_root), do: []
+
+  defp normalize_writable_root(root, writable_root) when is_binary(root) and is_binary(writable_root) do
+    root
+    |> normalize_path_token()
+    |> case do
+      :missing -> root
+      value when is_binary(value) -> value
+      _ -> root
+    end
+    |> String.trim()
+    |> case do
+      "" ->
+        nil
+
+      "~" ->
+        Path.expand(System.user_home!())
+
+      "~/" <> suffix ->
+        Path.expand(Path.join(System.user_home!(), suffix))
+
+      absolute_or_relative ->
+        if uri_path?(absolute_or_relative) do
+          absolute_or_relative
+        else
+          if Path.type(absolute_or_relative) == :relative do
+            Path.expand(absolute_or_relative, writable_root)
+          else
+            Path.expand(absolute_or_relative)
+          end
+        end
+    end
+  end
+
+  defp normalize_writable_root(_root, _writable_root), do: nil
+
+  defp prepend_writable_root(roots, writable_root) when is_list(roots) and is_binary(writable_root) do
+    if Enum.member?(roots, writable_root) do
+      roots
+    else
+      [writable_root | roots]
+    end
+  end
+
+  defp sandbox_writable_root(workspace) do
+    if is_binary(workspace) and String.trim(workspace) != "" do
+      Path.expand(workspace)
+    else
+      Path.expand(workspace_root())
+    end
   end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do

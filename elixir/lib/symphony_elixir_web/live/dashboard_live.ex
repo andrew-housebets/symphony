@@ -179,63 +179,47 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <table class="data-table data-table-running">
                 <colgroup>
                   <col style="width: 12rem;" />
-                  <col style="width: 8rem;" />
-                  <col style="width: 7.5rem;" />
+                  <col style="width: 7rem;" />
                   <col style="width: 8.5rem;" />
                   <col />
                   <col style="width: 10rem;" />
+                  <col style="width: 6rem;" />
                 </colgroup>
                 <thead>
                   <tr>
                     <th>Issue</th>
                     <th>State</th>
-                    <th>Session</th>
                     <th>Runtime / turns</th>
                     <th>Codex update</th>
                     <th>Tokens</th>
+                    <th></th>
                   </tr>
                 </thead>
-                <tbody>
-                  <tr :for={entry <- @payload.running}>
+                <tbody :for={entry <- @payload.running}>
+                  <tr>
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <div class="issue-actions">
+                          <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON</a>
+                          <%= if entry.session_id do %>
+                            <button
+                              type="button"
+                              class="subtle-button"
+                              data-label="Copy SID"
+                              data-copy={entry.session_id}
+                              onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                            >
+                              Copy SID
+                            </button>
+                          <% end %>
+                        </div>
                       </div>
                     </td>
                     <td>
                       <span class={state_badge_class(entry.state)}>
                         <%= entry.state %>
                       </span>
-                    </td>
-                    <td>
-                      <div class="session-stack">
-                        <%= if entry.session_id do %>
-                          <button
-                            type="button"
-                            class="subtle-button"
-                            data-label="Copy ID"
-                            data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
-                          >
-                            Copy ID
-                          </button>
-
-                          <details class="stdout-details">
-                            <summary class="stdout-summary">
-                              View stdout (<%= stdout_line_count(entry.stdout) %>)
-                            </summary>
-
-                            <%= if stdout_line_count(entry.stdout) == 0 do %>
-                              <p class="stdout-empty muted">No stdout captured yet.</p>
-                            <% else %>
-                              <pre class="stdout-log"><%= format_stdout(entry.stdout) %></pre>
-                            <% end %>
-                          </details>
-                        <% else %>
-                          <span class="muted">n/a</span>
-                        <% end %>
-                      </div>
                     </td>
                     <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
                     <td>
@@ -256,6 +240,42 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="token-stack numeric">
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                      </div>
+                    </td>
+                    <td>
+                      <%= if entry.session_id && stdout_line_count(entry.stdout) > 0 do %>
+                        <button
+                          type="button"
+                          class="stdout-toggle-btn"
+                          onclick={"
+                            const row = this.closest('tr').nextElementSibling;
+                            const isOpen = row.classList.toggle('stdout-row-open');
+                            this.setAttribute('aria-expanded', isOpen);
+                            this.querySelector('.stdout-toggle-icon').textContent = isOpen ? '▾' : '▸';
+                          "}
+                          aria-expanded="false"
+                        >
+                          <span class="stdout-toggle-icon">▸</span>
+                          Stdout
+                          <span class="stdout-count"><%= stdout_line_count(entry.stdout) %></span>
+                        </button>
+                      <% else %>
+                        <span class="muted" style="font-size: 0.78rem;">—</span>
+                      <% end %>
+                    </td>
+                  </tr>
+                  <tr class="stdout-row">
+                    <td colspan="6" class="stdout-cell">
+                      <div class="stdout-panel">
+                        <div class="stdout-panel-header">
+                          <span class="stdout-panel-title">stdout · <%= entry.issue_identifier %></span>
+                          <span class="stdout-panel-count"><%= stdout_line_count(entry.stdout) %> lines</span>
+                        </div>
+                        <%= if stdout_line_count(entry.stdout) == 0 do %>
+                          <p class="stdout-empty muted">No stdout captured yet.</p>
+                        <% else %>
+                          <pre class="stdout-log"><%= format_stdout(entry.stdout) %></pre>
+                        <% end %>
                       </div>
                     </td>
                   </tr>

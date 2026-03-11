@@ -1012,6 +1012,93 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner records a harness handoff in the Linear workpad after a turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-workpad-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{\"id\":1,\"result\":{}}'
+              ;;
+            2)
+              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-workpad\"}}}'
+              ;;
+            3)
+              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-workpad\"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"tokenUsage\":{\"total\":{\"input_tokens\":1200,\"output_tokens\":300,\"total_tokens\":1500}}}}'
+              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-workpad",
+        identifier: "MT-301",
+        title: "Fresh context handoff",
+        description: "Persist turn handoff in Linear",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-301",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
+      assert_receive {:memory_tracker_comment_created, "issue-workpad", comment_id, created_body}, 1_000
+      assert created_body =~ "## Codex Workpad"
+
+      assert_receive {:memory_tracker_comment_updated, ^comment_id, updated_body}, 1_000
+      assert updated_body =~ "### Harness Handoff"
+      assert updated_body =~ "Issue: `MT-301`"
+      assert updated_body =~ "Turn: `1` of `20`"
+      assert updated_body =~ "Token usage so far this run: `1500`"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner stops codex session when update recipient exits" do
     test_root =
       Path.join(
@@ -1139,12 +1226,9 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
             ;;
           4)
+            printf 'progress turn 1\n' > progress-turn.txt
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
             printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"input_tokens":90000,"output_tokens":60000,"total_tokens":150000}}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
@@ -1205,8 +1289,8 @@ defmodule SymphonyElixir.CoreTest do
 
       lines = File.read!(trace_file) |> String.split("\n", trim: true)
 
-      assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
-      assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
+      assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 2
+      assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 2
 
       turn_texts =
         lines
@@ -1224,6 +1308,9 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "fresh Codex context"
+      assert Enum.at(turn_texts, 1) =~ "Workpad comment ID:"
+      assert Enum.at(turn_texts, 1) =~ "Current workpad handoff:"
       assert Enum.at(turn_texts, 1) =~ "Token budget guidance:"
       assert Enum.at(turn_texts, 1) =~ "2,500,000 tokens per turn"
       assert Enum.at(turn_texts, 1) =~ "Current run usage so far: 150,000 tokens."
@@ -1274,11 +1361,8 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
             ;;
           4)
+            printf 'progress\n' > progress-max-turn.txt
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
-            printf '%s\\n' '{"method":"turn/completed"}'
-            ;;
-          5)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
         esac
@@ -1323,7 +1407,97 @@ defmodule SymphonyElixir.CoreTest do
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
 
       trace = File.read!(trace_file)
-      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(String.split(trace, "RUN", trim: true)) == 2
+      assert length(Regex.scan(~r/"method":"thread\/start"/, trace)) == 2
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner pauses active issue after a no-progress continuation turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-no-progress-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-no-progress"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-no-progress"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      issue = %Issue{
+        id: "issue-no-progress",
+        identifier: "MT-249",
+        title: "Pause on no progress",
+        description: "Avoid burning tokens on empty turns",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "In Progress"}]} end
+               )
+
+      assert_receive {:memory_tracker_state_update, "issue-no-progress", "Human Review"}, 1_000
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "RUN", trim: true)) == 2
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")

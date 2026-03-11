@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Linear.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.{Config, Linear.Comment, Linear.Issue}
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -103,6 +103,21 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_query """
+  query SymphonyLinearIssueComments($issueId: String!, $first: Int!) {
+    issue(id: $issueId) {
+      comments(first: $first) {
+        nodes {
+          id
+          body
+          updatedAt
+          resolvedAt
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     project_slug = Config.linear_project_slug()
@@ -155,6 +170,20 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
         end
+    end
+  end
+
+  @spec fetch_issue_comments(String.t()) :: {:ok, [Comment.t()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    with {:ok, body} <- graphql(@comments_query, %{issueId: issue_id, first: @issue_page_size}) do
+      comments =
+        body
+        |> get_in(["data", "issue", "comments", "nodes"])
+        |> List.wrap()
+        |> Enum.map(&normalize_comment/1)
+        |> Enum.reject(&is_nil/1)
+
+      {:ok, comments}
     end
   end
 
@@ -412,6 +441,17 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp normalize_issue(_issue, _assignee_filter), do: nil
 
+  defp normalize_comment(comment) when is_map(comment) do
+    %Comment{
+      id: map_string(comment, "id"),
+      body: map_string(comment, "body"),
+      updated_at: parse_datetime(map_string(comment, "updatedAt")),
+      resolved_at: parse_datetime(map_string(comment, "resolvedAt"))
+    }
+  end
+
+  defp normalize_comment(_comment), do: nil
+
   defp assignee_field(%{} = assignee, field) when is_binary(field), do: assignee[field]
   defp assignee_field(_assignee, _field), do: nil
 
@@ -515,6 +555,13 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_blockers(_), do: []
+
+  defp map_string(map, key) when is_map(map) do
+    case Map.get(map, key) do
+      value when is_binary(value) -> value
+      _ -> nil
+    end
+  end
 
   defp parse_datetime(nil), do: nil
 

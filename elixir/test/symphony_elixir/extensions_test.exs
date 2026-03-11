@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.Linear.Comment
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -23,6 +24,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     def fetch_issue_states_by_ids(issue_ids) do
       send(self(), {:fetch_issue_states_by_ids_called, issue_ids})
       {:ok, issue_ids}
+    end
+
+    def fetch_issue_comments(issue_id) do
+      send(self(), {:fetch_issue_comments_called, issue_id})
+      {:ok, []}
     end
 
     def graphql(query, variables) do
@@ -184,6 +190,11 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "tracker delegates to memory and linear adapters" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, %{id: "ignored"}])
+
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+      "issue-1" => [%Comment{id: "comment-1", body: "## Codex Workpad", resolved_at: nil}]
+    })
+
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
@@ -192,9 +203,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
+    assert {:ok, [%Comment{id: "comment-1"}]} = SymphonyElixir.Tracker.fetch_issue_comments("issue-1")
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+    assert {:ok, comment_id} = SymphonyElixir.Tracker.create_comment_with_id("issue-1", "tracked comment")
+    assert :ok = SymphonyElixir.Tracker.update_comment(comment_id, "updated tracked comment")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_comment_created, "issue-1", ^comment_id, "tracked comment"}
+    assert_receive {:memory_tracker_comment_updated, ^comment_id, "updated tracked comment"}
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
@@ -217,9 +233,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"])
     assert_receive {:fetch_issue_states_by_ids_called, ["issue-1"]}
 
+    assert {:ok, []} = Adapter.fetch_issue_comments("issue-1")
+    assert_receive {:fetch_issue_comments_called, "issue-1"}
+
     Process.put(
       {FakeLinearClient, :graphql_result},
-      {:ok, %{"data" => %{"commentCreate" => %{"success" => true}}}}
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true, "comment" => %{"id" => "comment-2"}}}}}
     )
 
     assert :ok = Adapter.create_comment("issue-1", "hello")
@@ -243,6 +262,24 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentCreate" => %{"success" => true, "comment" => %{"id" => "comment-3"}}}}}
+    )
+
+    assert {:ok, "comment-3"} = Adapter.create_comment_with_id("issue-1", "tracked")
+    assert_receive {:graphql_called, create_comment_with_id_query, %{body: "tracked", issueId: "issue-1"}}
+    assert create_comment_with_id_query =~ "commentCreate"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.update_comment("comment-3", "updated")
+    assert_receive {:graphql_called, update_comment_query, %{body: "updated", commentId: "comment-3"}}
+    assert update_comment_query =~ "commentUpdate"
 
     Process.put(
       {FakeLinearClient, :graphql_results},

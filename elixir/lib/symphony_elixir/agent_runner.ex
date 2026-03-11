@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace, Workpad}
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -50,28 +50,47 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts) do
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-    {:ok, usage_tracker} = Agent.start_link(fn -> %{input_tokens: 0, output_tokens: 0, total_tokens: 0} end)
 
-    with {:ok, session} <- AppServer.start_session(workspace) do
-      recipient_watcher = maybe_start_recipient_watcher(session, codex_update_recipient, issue)
+    {:ok, usage_tracker} =
+      Agent.start_link(fn ->
+        %{
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          last_event: nil,
+          last_summary: nil
+        }
+      end)
 
-      try do
-        do_run_codex_turns(
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          usage_tracker,
-          opts,
-          issue_state_fetcher,
-          1,
-          max_turns
-        )
-      after
-        stop_recipient_watcher(recipient_watcher)
-        AppServer.stop_session(session)
-        if Process.alive?(usage_tracker), do: Agent.stop(usage_tracker)
+    workpad =
+      case Workpad.ensure(issue, workspace) do
+        {:ok, state} ->
+          state
+
+        :skip ->
+          :skip
+
+        {:error, reason} ->
+          Logger.warning("Failed to initialize workpad for #{issue_context(issue)}: #{inspect(reason)}")
+          :skip
       end
+
+    update_usage_tracker_workpad(usage_tracker, workpad)
+
+    try do
+      do_run_codex_turns(
+        workspace,
+        issue,
+        codex_update_recipient,
+        usage_tracker,
+        workpad,
+        opts,
+        issue_state_fetcher,
+        1,
+        max_turns
+      )
+    after
+      if Process.alive?(usage_tracker), do: Agent.stop(usage_tracker)
     end
   end
 
@@ -107,37 +126,58 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(
-         app_session,
          workspace,
          issue,
          codex_update_recipient,
          usage_tracker,
+         workpad,
          opts,
          issue_state_fetcher,
          turn_number,
          max_turns
        ) do
+    workspace_before = current_workspace_snapshot(workspace)
+    workpad_before = refresh_workpad(workpad, issue, workspace)
     prompt = build_turn_prompt(issue, usage_tracker, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue, usage_tracker)
-           ) do
+           run_codex_turn(workspace, prompt, issue, codex_update_recipient, usage_tracker) do
+      usage = current_token_usage(usage_tracker)
+      workspace_after = current_workspace_snapshot(workspace)
+      latest_workpad = refresh_workpad(workpad_before, issue, workspace)
+      no_progress? = no_progress?(workspace_before, workspace_after, workpad_before, latest_workpad)
+
+      workpad =
+        case update_workpad_handoff(latest_workpad, issue, workspace, turn_number, max_turns, usage, no_progress?) do
+          {:ok, updated_workpad} ->
+            updated_workpad
+
+          :skip ->
+            latest_workpad
+
+          {:error, reason} ->
+            Logger.warning("Failed to update workpad handoff for #{issue_context(issue)}: #{inspect(reason)}")
+            latest_workpad
+        end
+
+      update_usage_tracker_workpad(usage_tracker, workpad)
+
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
       case continue_with_issue?(issue, issue_state_fetcher) do
+        {:continue, refreshed_issue} when no_progress? and turn_number > 1 ->
+          handle_no_progress(refreshed_issue)
+          :ok
+
         {:continue, refreshed_issue} when turn_number < max_turns ->
           Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
           do_run_codex_turns(
-            app_session,
             workspace,
             refreshed_issue,
             codex_update_recipient,
             usage_tracker,
+            workpad,
             opts,
             issue_state_fetcher,
             turn_number + 1,
@@ -162,18 +202,42 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp build_turn_prompt(_issue, usage_tracker, _opts, turn_number, max_turns) do
     usage = current_token_usage(usage_tracker)
+    workpad = current_workpad_state(usage_tracker)
+    workpad_comment_id = workpad_comment_id(workpad)
 
     """
     Continuation guidance:
 
     - The previous Codex turn completed normally, but the Linear issue is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
-    - Resume from the current workspace and workpad state instead of restarting from scratch.
-    - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
+    - Start this turn in a fresh Codex context and treat the current workspace and Linear workpad as the source of truth.
+    - Re-read the repository state and the `### Harness Handoff` section of the workpad instead of relying on prior chat history.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    - Workpad comment ID: `#{workpad_comment_id}`
+
+    Current workpad handoff:
+    #{Workpad.handoff_excerpt(workpad)}
 
     #{PromptBuilder.budget_guidance(run_total_tokens: usage.total_tokens, issue_window_tokens: usage.total_tokens)}
     """
+  end
+
+  defp run_codex_turn(workspace, prompt, issue, codex_update_recipient, usage_tracker) do
+    with {:ok, session} <- AppServer.start_session(workspace) do
+      recipient_watcher = maybe_start_recipient_watcher(session, codex_update_recipient, issue)
+
+      try do
+        AppServer.run_turn(
+          session,
+          prompt,
+          issue,
+          on_message: codex_message_handler(codex_update_recipient, issue, usage_tracker)
+        )
+      after
+        stop_recipient_watcher(recipient_watcher)
+        AppServer.stop_session(session)
+      end
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
@@ -223,24 +287,39 @@ defmodule SymphonyElixir.AgentRunner do
   defp current_token_usage(_usage_tracker), do: %{input_tokens: 0, output_tokens: 0, total_tokens: 0}
 
   defp track_token_usage(usage_tracker, message) when is_pid(usage_tracker) and is_map(message) do
+    event = Map.get(message, :event) || Map.get(message, "event")
+    summary = summarize_codex_message(message)
+
     case absolute_token_usage_from_message(message) do
       %{input_tokens: input_tokens, output_tokens: output_tokens, total_tokens: total_tokens} ->
         Agent.update(usage_tracker, fn usage ->
           %{
             input_tokens: max(Map.get(usage, :input_tokens, 0), input_tokens),
             output_tokens: max(Map.get(usage, :output_tokens, 0), output_tokens),
-            total_tokens: max(Map.get(usage, :total_tokens, 0), total_tokens)
+            total_tokens: max(Map.get(usage, :total_tokens, 0), total_tokens),
+            last_event: event,
+            last_summary: summary
           }
         end)
 
       _ ->
-        :ok
+        Agent.update(usage_tracker, fn usage ->
+          %{usage | last_event: event, last_summary: summary}
+        end)
     end
   catch
     :exit, _reason -> :ok
   end
 
   defp track_token_usage(_usage_tracker, _message), do: :ok
+
+  defp update_usage_tracker_workpad(usage_tracker, workpad) when is_pid(usage_tracker) do
+    Agent.update(usage_tracker, &Map.put(&1, :workpad, workpad))
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp update_usage_tracker_workpad(_usage_tracker, _workpad), do: :ok
 
   defp absolute_token_usage_from_message(message) when is_map(message) do
     payload = Map.get(message, :payload) || Map.get(message, "payload")
@@ -325,4 +404,102 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp integer_like(_value), do: nil
+
+  defp update_workpad_handoff(workpad, issue, workspace, turn_number, max_turns, usage, no_progress?) do
+    snapshot =
+      current_workspace_snapshot(workspace)
+      |> Map.put(:usage, usage)
+      |> Map.put(:last_event, Map.get(usage, :last_event))
+      |> Map.put(:last_summary, Map.get(usage, :last_summary))
+      |> Map.put(:no_progress?, no_progress?)
+
+    Workpad.record_turn_handoff(workpad, issue, workspace, turn_number, max_turns, snapshot)
+  end
+
+  defp current_workspace_snapshot(workspace) when is_binary(workspace) do
+    %{
+      branch: git_output(workspace, ["rev-parse", "--abbrev-ref", "HEAD"]),
+      head: git_output(workspace, ["rev-parse", "--short", "HEAD"]),
+      changed_files:
+        git_output(workspace, ["status", "--short"])
+        |> String.split("\n", trim: true)
+        |> Enum.take(20)
+    }
+  end
+
+  defp current_workspace_snapshot(_workspace), do: %{branch: "unknown", head: "unknown", changed_files: []}
+
+  defp git_output(workspace, args) do
+    case System.cmd("git", ["-C", workspace | args], stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      _ -> "unknown"
+    end
+  end
+
+  defp summarize_codex_message(message) when is_map(message) do
+    event = Map.get(message, :event) || Map.get(message, "event")
+    payload = Map.get(message, :payload) || Map.get(message, "payload")
+    method = if is_map(payload), do: Map.get(payload, "method") || Map.get(payload, :method)
+
+    cond do
+      is_binary(method) -> method
+      is_atom(event) -> Atom.to_string(event)
+      is_binary(event) -> event
+      true -> "unknown"
+    end
+  end
+
+  defp summarize_codex_message(_message), do: "unknown"
+
+  defp refresh_workpad(:skip, _issue, _workspace), do: :skip
+
+  defp refresh_workpad(_workpad, issue, workspace) do
+    case Workpad.ensure(issue, workspace) do
+      {:ok, refreshed} -> refreshed
+      :skip -> :skip
+      {:error, _reason} -> :skip
+    end
+  end
+
+  defp no_progress?(workspace_before, workspace_after, workpad_before, workpad_after) do
+    not workspace_progress?(workspace_before, workspace_after) and
+      not workpad_progress?(workpad_before, workpad_after)
+  end
+
+  defp workspace_progress?(before_snapshot, after_snapshot) do
+    Map.get(before_snapshot, :head) != Map.get(after_snapshot, :head) or
+      Map.get(before_snapshot, :changed_files) != Map.get(after_snapshot, :changed_files)
+  end
+
+  defp workpad_progress?(%{body: before_body}, %{body: after_body}) do
+    Workpad.without_harness_handoff(before_body) != Workpad.without_harness_handoff(after_body)
+  end
+
+  defp workpad_progress?(_before, _after), do: false
+
+  defp handle_no_progress(%Issue{} = issue) do
+    Logger.warning("No progress detected for #{issue_context(issue)}; pausing issue to avoid token burn")
+
+    case List.first(Config.linear_paused_states()) do
+      state_name when is_binary(state_name) and state_name != "" ->
+        case Tracker.update_issue_state(issue.id, state_name) do
+          :ok -> :ok
+          {:error, reason} -> Logger.warning("Failed to pause no-progress issue #{issue_context(issue)}: #{inspect(reason)}")
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp current_workpad_state(usage_tracker) when is_pid(usage_tracker) do
+    Agent.get(usage_tracker, &Map.get(&1, :workpad, :skip))
+  catch
+    :exit, _reason -> :skip
+  end
+
+  defp current_workpad_state(_usage_tracker), do: :skip
+
+  defp workpad_comment_id(%{comment_id: comment_id}) when is_binary(comment_id), do: comment_id
+  defp workpad_comment_id(_workpad), do: "unknown"
 end

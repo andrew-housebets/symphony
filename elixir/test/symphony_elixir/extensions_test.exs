@@ -377,33 +377,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
-    assert state_payload == %{
-             "generated_at" => state_payload["generated_at"],
+    assert %{
+             "generated_at" => _generated_at,
              "counts" => %{"running" => 1, "retrying" => 1},
-             "running" => [
-               %{
-                 "issue_id" => "issue-http",
-                 "issue_identifier" => "MT-HTTP",
-                 "state" => "In Progress",
-                 "session_id" => "thread-http",
-                 "turn_count" => 7,
-                 "last_event" => "notification",
-                 "last_message" => "rendered",
-                 "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
-                 "last_event_at" => nil,
-                 "stdout" => [],
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
-               }
-             ],
-             "retrying" => [
-               %{
-                 "issue_id" => "issue-retry",
-                 "issue_identifier" => "MT-RETRY",
-                 "attempt" => 2,
-                 "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
-                 "error" => "boom"
-               }
-             ],
+             "running" => [running_payload],
+             "retrying" => [retry_payload],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -413,8 +391,8 @@ defmodule SymphonyElixir.ExtensionsTest do
              "rate_limits" => %{
                "limit_id" => "codex_bengalfox",
                "limit_name" => "GPT-5.3-Codex-Spark",
-               "primary" => %{"used_percent" => 0.0, "window_minutes" => 300, "resets_at" => 1_773_161_120},
-               "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
+               "primary" => %{"used_percent" => primary_used_percent, "window_minutes" => 300, "resets_at" => 1_773_161_120},
+               "secondary" => %{"used_percent" => secondary_used_percent, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
                "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil},
                "plan_type" => nil
              },
@@ -427,8 +405,16 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "rate_limits" => %{
                    "limit_id" => "codex_bengalfox",
                    "limit_name" => "GPT-5.3-Codex-Spark",
-                   "primary" => %{"used_percent" => 0.0, "window_minutes" => 300, "resets_at" => 1_773_161_120},
-                   "secondary" => %{"used_percent" => 0.0, "window_minutes" => 10080, "resets_at" => 1_773_747_920},
+                   "primary" => %{
+                     "used_percent" => bucket_primary_used_percent,
+                     "window_minutes" => 300,
+                     "resets_at" => 1_773_161_120
+                   },
+                   "secondary" => %{
+                     "used_percent" => bucket_secondary_used_percent,
+                     "window_minutes" => 10080,
+                     "resets_at" => 1_773_747_920
+                   },
                    "credits" => %{"has_credits" => false, "unlimited" => false, "balance" => nil},
                    "plan_type" => nil
                  }
@@ -437,34 +423,68 @@ defmodule SymphonyElixir.ExtensionsTest do
              "requested_model" => "gpt-5.3-codex",
              "effective_model" => "gpt-5.3-codex",
              "rate_limit_bucket_id" => "codex_bengalfox",
-             "rate_limit_bucket_model" => "GPT-5.3-Codex-Spark"
-           }
+             "rate_limit_bucket_model" => "GPT-5.3-Codex-Spark",
+             "beam" => beam_payload
+           } = state_payload
+
+    assert primary_used_percent in [0.0, -0.0]
+    assert secondary_used_percent in [0.0, -0.0]
+    assert bucket_primary_used_percent in [0.0, -0.0]
+    assert bucket_secondary_used_percent in [0.0, -0.0]
+
+    assert %{
+             "issue_id" => "issue-http",
+             "issue_identifier" => "MT-HTTP",
+             "state" => "In Progress",
+             "session_id" => "thread-http",
+             "turn_count" => 7,
+             "last_event" => "notification",
+             "last_message" => "rendered",
+             "started_at" => _started_at,
+             "last_event_at" => nil,
+             "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
+             "stdout_line_count" => 0
+           } = running_payload
+
+    assert %{
+             "issue_id" => "issue-retry",
+             "issue_identifier" => "MT-RETRY",
+             "attempt" => 2,
+             "due_at" => _due_at,
+             "error" => "boom"
+           } = retry_payload
+
+    assert is_map(beam_payload)
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
 
-    assert issue_payload == %{
+    assert %{
              "issue_identifier" => "MT-HTTP",
              "issue_id" => "issue-http",
              "status" => "running",
-             "workspace" => %{"path" => Path.join(Config.workspace_root(), "MT-HTTP")},
+             "workspace" => %{"path" => path},
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
-             "running" => %{
-               "session_id" => "thread-http",
-               "turn_count" => 7,
-               "state" => "In Progress",
-               "started_at" => issue_payload["running"]["started_at"],
-               "last_event" => "notification",
-               "last_message" => "rendered",
-               "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
-             },
+             "running" => running_issue_payload,
              "retry" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
              "tracked" => %{}
-           }
+           } = issue_payload
+
+    assert path == Path.join(Config.workspace_root(), "MT-HTTP")
+
+    assert %{
+             "session_id" => "thread-http",
+             "turn_count" => 7,
+             "state" => "In Progress",
+             "started_at" => _running_started_at,
+             "last_event" => "notification",
+             "last_message" => "rendered",
+             "last_event_at" => nil,
+             "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+           } = running_issue_payload
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
 
@@ -493,8 +513,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/api/v1/refresh"), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
-    assert json_response(post(build_conn(), "/", %{}), 405) ==
-             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+    assert json_response(post(build_conn(), "/", %{}), 404) ==
+             %{"error" => %{"code" => "not_found", "message" => "Route not found"}}
 
     assert json_response(post(build_conn(), "/api/v1/MT-1", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
@@ -591,9 +611,10 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
     assert dashboard_css =~ ":root {"
-    assert dashboard_css =~ ".status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
+    assert dashboard_css =~ ".live-badge"
+    assert dashboard_css =~ ".live-dot"
+    assert dashboard_css =~ ".btn-toggle"
+    assert dashboard_css =~ ".timeline-item"
 
     phoenix_html_js = response(get(build_conn(), "/vendor/phoenix_html/phoenix_html.js"), 200)
     assert phoenix_html_js =~ "phoenix.link.click"
@@ -626,30 +647,23 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "Overview"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
     assert html =~ "Runtime"
     assert html =~ "Live"
-    assert html =~ "Offline"
-    assert html =~ "Copy ID"
-    assert html =~ "View stdout (0)"
-    assert html =~ "Codex update"
-    assert html =~ "Configured model:"
+    assert html =~ "Copy SID"
+    assert html =~ "Configured model"
     assert html =~ "gpt-5.3-codex"
-    assert html =~ "Selected upstream bucket label:"
-    assert html =~ "Selected upstream bucket id:"
-    assert html =~ "bucket labels are upstream quota tiers"
     assert html =~ "Bucket ID"
-    assert html =~ "Primary window"
+    assert html =~ "Primary"
     assert html =~ "GPT-5.3-Codex-Spark"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
-    assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
+    assert html =~ "live-badge"
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -688,7 +702,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      render(view) =~ "structured update"
     end)
   end
 

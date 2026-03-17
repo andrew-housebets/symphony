@@ -13,7 +13,8 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
-  @max_session_stdout_bytes 2_000
+  @max_session_stdout_bytes 8_000
+  @max_session_stdout_detail_bytes 12_000
   @stats_flush_interval_ms 30_000
   @empty_codex_totals %{
     input_tokens: 0,
@@ -783,6 +784,7 @@ defmodule SymphonyElixir.Orchestrator do
             budget_continuation_blocked: false,
             budget_suppressed: false,
             budget_stop_reason: nil,
+            spawn_agent_calls: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
           })
@@ -1156,6 +1158,7 @@ defmodule SymphonyElixir.Orchestrator do
           budget_continuation_blocked: Map.get(metadata, :budget_continuation_blocked, false),
           budget_suppressed: Map.get(metadata, :budget_suppressed, false),
           budget_stop_reason: Map.get(metadata, :budget_stop_reason),
+          spawn_agent_calls: Map.get(metadata, :spawn_agent_calls, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
@@ -1277,6 +1280,9 @@ defmodule SymphonyElixir.Orchestrator do
     turn_count = Map.get(running_entry, :turn_count, 0)
     {stdout_line_count, stdout_buffer} = append_stdout_to_file(running_entry, update)
 
+    spawn_agent_calls =
+      Map.get(running_entry, :spawn_agent_calls, 0) + spawn_agent_call_delta(update)
+
     updated_running_entry =
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
@@ -1292,7 +1298,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update),
         stdout_line_count: stdout_line_count,
-        stdout_buffer: stdout_buffer
+        stdout_buffer: stdout_buffer,
+        spawn_agent_calls: spawn_agent_calls
       })
       |> maybe_reset_turn_budget_baselines(event)
 
@@ -1360,7 +1367,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   # Events to skip from the session stdout trace
-  @stdout_skip_events [:session_started, :startup_failed]
+  @stdout_skip_events [:startup_failed]
 
   # Streaming delta notification methods — these get buffered and concatenated
   # so the log reads like continuous model output (similar to Codex CLI).
@@ -1385,24 +1392,80 @@ defmodule SymphonyElixir.Orchestrator do
     account/chatgptAuthTokens/refresh
   )
 
+  @stdout_summary_paths [
+    ["params", "msg", "summaryText"],
+    [:params, :msg, :summaryText],
+    ["params", "msg", "text"],
+    [:params, :msg, :text],
+    ["params", "msg", "content"],
+    [:params, :msg, :content],
+    ["params", "summaryText"],
+    [:params, :summaryText],
+    ["params", "text"],
+    [:params, :text],
+    ["params", "question"],
+    [:params, :question],
+    ["params", "prompt"],
+    [:params, :prompt],
+    ["params", "parsedCmd"],
+    [:params, :parsedCmd],
+    ["params", "command"],
+    [:params, :command],
+    ["params", "item", "title"],
+    [:params, :item, :title]
+  ]
+
+  @stdout_thread_id_paths [
+    ["thread_id"],
+    [:thread_id],
+    ["threadId"],
+    [:threadId],
+    ["params", "threadId"],
+    [:params, :threadId],
+    ["params", "thread", "id"],
+    [:params, :thread, :id],
+    ["params", "item", "threadId"],
+    [:params, :item, :threadId],
+    ["params", "msg", "threadId"],
+    [:params, :msg, :threadId],
+    ["params", "msg", "thread", "id"],
+    [:params, :msg, :thread, :id]
+  ]
+
+  @stdout_turn_id_paths [
+    ["turn_id"],
+    [:turn_id],
+    ["turnId"],
+    [:turnId],
+    ["params", "turnId"],
+    [:params, :turnId],
+    ["params", "turn", "id"],
+    [:params, :turn, :id],
+    ["params", "item", "turnId"],
+    [:params, :item, :turnId],
+    ["params", "msg", "turnId"],
+    [:params, :msg, :turnId],
+    ["params", "msg", "turn", "id"],
+    [:params, :msg, :turn, :id]
+  ]
+
   defp append_stdout_to_file(running_entry, update) do
     current_count = Map.get(running_entry, :stdout_line_count, 0)
-    buffer = Map.get(running_entry, :stdout_buffer, "")
+    buffer = normalize_stdout_buffer(Map.get(running_entry, :stdout_buffer, ""))
     identifier = running_entry.identifier
 
     case classify_update(update) do
       :skip ->
         {current_count, buffer}
 
-      {:streaming_delta, delta_text} ->
-        # Accumulate raw delta text in the buffer — don't write a line yet
-        {current_count, buffer <> delta_text}
+      {:streaming_delta, delta_text, metadata} ->
+        append_streaming_delta(identifier, buffer, current_count, delta_text, metadata, update_timestamp(update))
 
-      {:log_line, text} ->
+      {:log_line, text, metadata} ->
         # Flush any buffered streaming text first, then write the event line
         count = flush_buffer(identifier, buffer, current_count)
-        count = write_log_line(identifier, update, text, count)
-        {count, ""}
+        count = write_log_line(identifier, update, text, metadata, count)
+        {count, empty_stdout_buffer()}
     end
   end
 
@@ -1420,38 +1483,74 @@ defmodule SymphonyElixir.Orchestrator do
       method in @streaming_delta_methods ->
         case extract_raw_delta(payload) do
           nil -> :skip
-          text -> {:streaming_delta, text}
+          text -> {:streaming_delta, text, stdout_metadata(:notification, payload, method)}
         end
 
       true ->
         message = %{event: :notification, message: payload}
         text = StatusDashboard.humanize_codex_message(message)
+        metadata = stdout_metadata(:notification, payload, method)
 
         case sanitize_session_stdout_text(text) do
           nil -> :skip
-          sanitized -> {:log_line, sanitized}
+          sanitized -> {:log_line, sanitized, metadata}
         end
     end
   end
 
   defp classify_update(%{event: :malformed} = update) do
+    raw = update[:payload] || update[:raw]
+
     case sanitize_session_stdout_text(update[:payload] || update[:raw]) do
-      nil -> :skip
-      text -> {:log_line, text}
+      nil ->
+        :skip
+
+      text ->
+        {:log_line, text,
+         %{
+           kind: "malformed",
+           event: "malformed",
+           details:
+             raw
+             |> case do
+               value when is_binary(value) -> value
+               value -> inspect(value, pretty: true, limit: 40, printable_limit: 4_000)
+             end
+             |> sanitize_session_stdout_text(@max_session_stdout_detail_bytes)
+         }}
     end
   end
 
   defp classify_update(%{event: event} = update) do
     message = summarize_codex_update(update)
     text = StatusDashboard.humanize_codex_message(message)
+    metadata = stdout_metadata(event, stdout_metadata_payload(update), nil)
 
     case sanitize_session_stdout_text(text) do
       nil -> :skip
-      sanitized -> {:log_line, "[#{event}] #{sanitized}"}
+      sanitized -> {:log_line, "[#{event}] #{sanitized}", metadata}
     end
   end
 
   defp classify_update(_), do: :skip
+
+  defp stdout_metadata_payload(%{payload: payload} = update) when is_map(payload) do
+    Map.merge(payload, %{
+      thread_id: update[:thread_id] || update[:threadId],
+      turn_id: update[:turn_id] || update[:turnId],
+      session_id: update[:session_id] || update[:sessionId]
+    })
+  end
+
+  defp stdout_metadata_payload(update) when is_map(update) do
+    %{
+      thread_id: update[:thread_id] || update[:threadId],
+      turn_id: update[:turn_id] || update[:turnId],
+      session_id: update[:session_id] || update[:sessionId]
+    }
+  end
+
+  defp stdout_metadata_payload(_), do: %{}
 
   # Extract raw delta text from streaming notification payloads
   defp extract_raw_delta(payload) do
@@ -1487,13 +1586,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp get_nested(_, _), do: nil
 
+  defp flush_buffer(_identifier, %{text: ""}, count), do: count
   defp flush_buffer(_identifier, "", count), do: count
 
-  defp flush_buffer(identifier, buffer, count) do
-    text = sanitize_session_stdout_text(buffer)
+  defp flush_buffer(identifier, %{text: buffer_text, metadata: metadata, timestamp: timestamp}, count) do
+    text = sanitize_session_stdout_text(buffer_text)
 
     if text do
-      case SessionLog.append(identifier, DateTime.utc_now(), text) do
+      metadata = Map.put_new(metadata, :kind, "stream")
+
+      case SessionLog.append(identifier, timestamp || DateTime.utc_now(), text, metadata) do
         {:ok, new_count} -> new_count
         :error -> count
       end
@@ -1502,10 +1604,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp write_log_line(identifier, update, text, count) do
+  defp flush_buffer(identifier, buffer, count) when is_binary(buffer) do
+    flush_buffer(identifier, %{text: buffer, metadata: %{}, timestamp: DateTime.utc_now()}, count)
+  end
+
+  defp write_log_line(identifier, update, text, metadata, count) do
     timestamp = update_timestamp(update)
 
-    case SessionLog.append(identifier, timestamp, text) do
+    case SessionLog.append(identifier, timestamp, text, metadata) do
       {:ok, new_count} -> new_count
       :error -> count
     end
@@ -1514,20 +1620,189 @@ defmodule SymphonyElixir.Orchestrator do
   defp update_timestamp(%{timestamp: %DateTime{} = timestamp}), do: timestamp
   defp update_timestamp(_update), do: DateTime.utc_now()
 
-  defp sanitize_session_stdout_text(text) when is_binary(text) do
+  defp sanitize_session_stdout_text(text, max_bytes \\ @max_session_stdout_bytes)
+
+  defp sanitize_session_stdout_text(text, max_bytes) when is_binary(text) and is_integer(max_bytes) and max_bytes > 0 do
     text
     |> String.replace(~r/\x1B\[[0-9;]*[A-Za-z]/, "")
     |> String.replace(~r/\x1B./, "")
     |> String.replace(~r/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/, "")
     |> String.trim_trailing()
-    |> String.slice(0, @max_session_stdout_bytes)
+    |> String.slice(0, max_bytes)
     |> case do
       "" -> nil
       sanitized -> sanitized
     end
   end
 
-  defp sanitize_session_stdout_text(_text), do: nil
+  defp sanitize_session_stdout_text(_text, _max_bytes), do: nil
+
+  defp empty_stdout_buffer do
+    %{text: "", metadata: %{}, timestamp: nil}
+  end
+
+  defp normalize_stdout_buffer(%{text: text} = buffer) when is_binary(text) do
+    %{
+      text: text,
+      metadata: Map.get(buffer, :metadata, %{}),
+      timestamp: Map.get(buffer, :timestamp)
+    }
+  end
+
+  defp normalize_stdout_buffer(buffer) when is_binary(buffer) do
+    %{text: buffer, metadata: %{}, timestamp: nil}
+  end
+
+  defp normalize_stdout_buffer(_), do: empty_stdout_buffer()
+
+  defp append_streaming_delta(identifier, buffer, count, delta_text, metadata, timestamp)
+       when is_binary(delta_text) and is_map(metadata) do
+    cond do
+      buffer.text == "" ->
+        {count, %{text: delta_text, metadata: metadata, timestamp: timestamp}}
+
+      compatible_stream_buffer?(Map.get(buffer, :metadata, %{}), metadata) ->
+        {count, %{buffer | text: buffer.text <> delta_text, timestamp: timestamp}}
+
+      true ->
+        flushed_count = flush_buffer(identifier, buffer, count)
+        {flushed_count, %{text: delta_text, metadata: metadata, timestamp: timestamp}}
+    end
+  end
+
+  defp append_streaming_delta(_identifier, buffer, count, _delta_text, _metadata, _timestamp),
+    do: {count, buffer}
+
+  defp compatible_stream_buffer?(left, right) when is_map(left) and is_map(right) do
+    Enum.all?([:kind, :method, :thread_id, :turn_id], fn key ->
+      Map.get(left, key) == Map.get(right, key)
+    end)
+  end
+
+  defp compatible_stream_buffer?(_left, _right), do: false
+
+  defp stdout_metadata(event, payload, method) do
+    method = normalize_method(method)
+    details = stdout_details(payload, method)
+
+    %{
+      kind: stdout_kind(event, method),
+      event: to_string(event),
+      method: method,
+      thread_id: extract_stdout_thread_id(payload),
+      turn_id: extract_stdout_turn_id(payload),
+      tool: extract_stdout_tool(payload),
+      item_type: extract_stdout_item_type(payload),
+      details: details
+    }
+    |> drop_nil_values()
+  end
+
+  defp normalize_method(method) when is_binary(method) do
+    method
+    |> String.trim()
+    |> case do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_method(_method), do: nil
+
+  defp stdout_kind(:session_started, _method), do: "session"
+  defp stdout_kind(:malformed, _method), do: "malformed"
+
+  defp stdout_kind(_event, method) when is_binary(method) do
+    cond do
+      String.contains?(method, "reasoning") -> "reasoning"
+      String.contains?(method, "agentMessage") -> "message"
+      String.contains?(method, "commandExecution") or String.contains?(method, "exec_command") -> "command"
+      String.contains?(method, "fileChange") -> "file_change"
+      String.contains?(method, "tool/") or method == "item/tool/call" -> "tool"
+      String.contains?(method, "plan") -> "plan"
+      String.contains?(method, "tokenUsage") or String.contains?(method, "token_count") -> "token"
+      true -> "event"
+    end
+  end
+
+  defp stdout_kind(_event, _method), do: "event"
+
+  defp stdout_details(payload, method) when is_map(payload) do
+    cond do
+      method in @streaming_delta_methods ->
+        nil
+
+      true ->
+        extract_first_binary(payload, @stdout_summary_paths) ||
+          payload
+          |> inspect(pretty: true, limit: 80, printable_limit: 6_000)
+          |> sanitize_session_stdout_text(@max_session_stdout_detail_bytes)
+    end
+  end
+
+  defp stdout_details(_payload, _method), do: nil
+
+  defp extract_stdout_thread_id(payload) do
+    extract_first_binary(payload, @stdout_thread_id_paths)
+  end
+
+  defp extract_stdout_turn_id(payload) do
+    extract_first_binary(payload, @stdout_turn_id_paths)
+  end
+
+  defp extract_stdout_tool(payload) when is_map(payload) do
+    extract_first_binary(payload, [
+      ["params", "tool"],
+      [:params, :tool],
+      ["params", "name"],
+      [:params, :name],
+      ["params", "item", "tool"],
+      [:params, :item, :tool],
+      ["params", "item", "name"],
+      [:params, :item, :name]
+    ])
+  end
+
+  defp extract_stdout_tool(_payload), do: nil
+
+  defp extract_stdout_item_type(payload) when is_map(payload) do
+    extract_first_binary(payload, [
+      ["params", "item", "type"],
+      [:params, :item, :type],
+      ["params", "msg", "type"],
+      [:params, :msg, :type]
+    ])
+  end
+
+  defp extract_stdout_item_type(_payload), do: nil
+
+  defp extract_first_binary(payload, paths) when is_map(payload) and is_list(paths) do
+    Enum.find_value(paths, fn path ->
+      case map_at_path(payload, path) do
+        value when is_binary(value) ->
+          trimmed = String.trim(value)
+          if trimmed == "", do: nil, else: sanitize_session_stdout_text(trimmed, @max_session_stdout_detail_bytes)
+
+        _ ->
+          nil
+      end
+    end)
+  end
+
+  defp extract_first_binary(_payload, _paths), do: nil
+
+  defp drop_nil_values(map) do
+    Enum.reduce(map, %{}, fn
+      {_key, nil}, acc ->
+        acc
+
+      {_key, ""}, acc ->
+        acc
+
+      {key, value}, acc ->
+        Map.put(acc, key, value)
+    end)
+  end
 
   defp schedule_tick(delay_ms) do
     :timer.send_after(delay_ms, self(), :tick)
@@ -1550,8 +1825,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     # Flush any remaining stdout buffer before removing the entry
     if running_entry do
-      buffer = Map.get(running_entry, :stdout_buffer, "")
-      if buffer != "", do: flush_buffer(running_entry.identifier, buffer, 0)
+      buffer = normalize_stdout_buffer(Map.get(running_entry, :stdout_buffer, ""))
+      if buffer.text != "", do: flush_buffer(running_entry.identifier, buffer, 0)
     end
 
     {running_entry, %{state | running: Map.delete(state.running, issue_id)}}
@@ -2399,6 +2674,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
 
         running_entry ->
+          previous_soft_limits = Map.get(running_entry, :budget_soft_limits, [])
           evaluation = evaluate_token_budget(state, issue_id, running_entry, settings)
 
           running_entry =
@@ -2413,14 +2689,19 @@ defmodule SymphonyElixir.Orchestrator do
               budget_stop_reason: evaluation.stop_reason
             })
 
+          maybe_log_soft_limit_advisory(running_entry, previous_soft_limits, evaluation)
+
           state = %{state | running: Map.put(state.running, issue_id, running_entry)}
 
           case evaluation.hard_limit do
             nil ->
               maybe_apply_budget_suppression(state, issue_id, running_entry, evaluation)
 
-            _hard_limit ->
+            :per_issue_window_hard_limit ->
               force_stop_issue_for_budget(state, issue_id, running_entry, evaluation)
+
+            _hard_limit ->
+              force_restart_issue_for_budget(state, issue_id, running_entry, evaluation)
           end
       end
     else
@@ -2461,13 +2742,8 @@ defmodule SymphonyElixir.Orchestrator do
       rolling_issue_window_tokens: rolling_issue_window_tokens,
       soft_limits: soft_limits,
       hard_limit: hard_limit,
-      continuation_blocked:
-        :per_run_soft_limit in soft_limits or
-          :per_issue_window_soft_limit in soft_limits or
-          not is_nil(hard_limit),
-      suppressed:
-        :per_issue_window_soft_limit in soft_limits or
-          not is_nil(hard_limit),
+      continuation_blocked: hard_limit == :per_issue_window_hard_limit,
+      suppressed: hard_limit == :per_issue_window_hard_limit,
       stop_reason: hard_limit && Atom.to_string(hard_limit)
     }
   end
@@ -2475,16 +2751,24 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_add_budget_limit(limits, true, limit), do: [limit | limits]
   defp maybe_add_budget_limit(limits, false, _limit), do: limits
 
-  defp maybe_apply_budget_suppression(state, issue_id, running_entry, evaluation) do
-    if :per_issue_window_soft_limit in evaluation.soft_limits do
-      put_budget_suppression(state, issue_id, running_entry, %{
-        reason: "per_issue_window_soft_limit",
-        threshold_tokens: Config.token_budget_settings().per_issue_window_soft_tokens,
-        enforced_at: DateTime.utc_now()
-      })
-    else
-      state
+  defp maybe_apply_budget_suppression(state, _issue_id, _running_entry, _evaluation), do: state
+
+  defp maybe_log_soft_limit_advisory(running_entry, previous_soft_limits, evaluation) do
+    new_soft_limits = evaluation.soft_limits -- previous_soft_limits
+
+    if new_soft_limits != [] do
+      spawn_agent_calls = Map.get(running_entry, :spawn_agent_calls, 0)
+
+      Logger.warning(
+        "Token soft-limit advisory for issue_identifier=#{running_entry.identifier} " <>
+          "limits=#{Enum.join(Enum.map(new_soft_limits, &Atom.to_string/1), ",")} " <>
+          "run_tokens=#{evaluation.current_run_tokens} turn_tokens=#{evaluation.current_turn_tokens} " <>
+          "issue_window_tokens=#{evaluation.rolling_issue_window_tokens} " <>
+          "spawn_agent_calls=#{spawn_agent_calls}"
+      )
     end
+
+    :ok
   end
 
   defp force_stop_issue_for_budget(state, issue_id, running_entry, evaluation) do
@@ -2496,6 +2780,16 @@ defmodule SymphonyElixir.Orchestrator do
         enforced_at: DateTime.utc_now()
       })
       |> record_budget_hard_stop(issue_id, running_entry, evaluation)
+
+    maybe_handle_over_budget_issue(running_entry, evaluation)
+    state
+  end
+
+  defp force_restart_issue_for_budget(state, issue_id, running_entry, evaluation) do
+    state =
+      state
+      |> record_budget_hard_stop(issue_id, running_entry, evaluation)
+      |> maybe_schedule_continuation_retry(issue_id, running_entry)
 
     maybe_handle_over_budget_issue(running_entry, evaluation)
     state
@@ -2549,7 +2843,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
     end
 
-    if settings.pause_on_hard_limit do
+    if settings.pause_on_hard_limit and evaluation.hard_limit == :per_issue_window_hard_limit do
       case List.first(Config.linear_paused_states()) do
         state_name when is_binary(state_name) and state_name != "" ->
           case Tracker.update_issue_state(running_entry.issue.id, state_name) do
@@ -2566,6 +2860,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_handle_over_budget_issue(_running_entry, _evaluation), do: :ok
 
   defp format_budget_comment(_running_entry, evaluation, settings) do
+    action =
+      case evaluation.hard_limit do
+        :per_issue_window_hard_limit ->
+          "stopped the worker#{if settings.pause_on_hard_limit, do: " and moved the issue to a paused state when available", else: ""}"
+
+        :per_turn_hard_limit ->
+          "stopped the current turn and queued a continuation retry with a fresh context"
+
+        :per_run_hard_limit ->
+          "stopped the current run and queued a continuation retry with a fresh context"
+
+        _ ->
+          "stopped the worker"
+      end
+
     """
     Symphony stopped this run because it exceeded the configured token budget.
 
@@ -2573,7 +2882,7 @@ defmodule SymphonyElixir.Orchestrator do
     - Current run tokens: `#{evaluation.current_run_tokens}`
     - Current turn tokens: `#{evaluation.current_turn_tokens}`
     - Rolling issue-window tokens (#{settings.issue_window_seconds}s): `#{evaluation.rolling_issue_window_tokens}`
-    - Action: stopped the worker#{if settings.pause_on_hard_limit, do: " and moved the issue to a paused state when available", else: ""}
+    - Action: #{action}
     """
     |> String.trim()
   end
@@ -2604,6 +2913,50 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp budget_issue_suppressed?(_state, _issue_id), do: false
+
+  defp spawn_agent_call_delta(%{payload: payload}) when is_map(payload) do
+    method = map_value(payload, ["method", :method])
+
+    case method do
+      "item/started" ->
+        if spawn_agent_item?(map_at_path(payload, ["params", "item"]) || map_at_path(payload, [:params, :item])) do
+          1
+        else
+          0
+        end
+
+      "item/tool/call" ->
+        if spawn_agent_call?(map_at_path(payload, ["params"]) || map_at_path(payload, [:params])) do
+          1
+        else
+          0
+        end
+
+      _ ->
+        0
+    end
+  end
+
+  defp spawn_agent_call_delta(_update), do: 0
+
+  defp spawn_agent_item?(item) when is_map(item) do
+    spawn_agent_call?(item) ||
+      spawn_agent_call?(map_at_path(item, ["params"]) || map_at_path(item, [:params]))
+  end
+
+  defp spawn_agent_item?(_item), do: false
+
+  defp spawn_agent_call?(payload) when is_map(payload) do
+    case map_value(payload, ["tool", :tool, "name", :name]) do
+      value when is_binary(value) ->
+        String.trim(value) == "spawn_agent"
+
+      _ ->
+        false
+    end
+  end
+
+  defp spawn_agent_call?(_payload), do: false
 
   defp rolling_issue_window_tokens(state, issue_id) when is_binary(issue_id) do
     state

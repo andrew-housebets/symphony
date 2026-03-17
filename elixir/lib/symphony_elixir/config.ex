@@ -93,7 +93,21 @@ defmodule SymphonyElixir.Config do
                                type: :map,
                                default: %{},
                                keys: [
-                                 root: [type: {:or, [:string, nil]}, default: @default_workspace_root]
+                                 root: [type: {:or, [:string, nil]}, default: @default_workspace_root],
+                                 source_repo_map: [
+                                   type: :map,
+                                   default: %{},
+                                   keys: [
+                                     default: [
+                                       type: {:or, [:string, {:list, :string}, nil]},
+                                       default: nil
+                                     ],
+                                     label_overrides: [
+                                       type: {:map, :string, {:or, [:string, {:list, :string}]}},
+                                       default: %{}
+                                     ]
+                                   ]
+                                 ]
                                ]
                              ],
                              agent: [
@@ -240,6 +254,10 @@ defmodule SymphonyElixir.Config do
           before_remove: String.t() | nil,
           timeout_ms: pos_integer()
         }
+  @type workspace_source_repo_map :: %{
+          default: [String.t()],
+          label_overrides: %{optional(String.t()) => [String.t()]}
+        }
   @type token_budget_settings :: %{
           enabled: boolean(),
           per_turn_soft_tokens: pos_integer(),
@@ -315,6 +333,57 @@ defmodule SymphonyElixir.Config do
     |> get_in([:workspace, :root])
     |> resolve_path_value(@default_workspace_root)
   end
+
+  @spec workspace_source_repo_map() :: workspace_source_repo_map()
+  def workspace_source_repo_map do
+    source_repo_map = get_in(validated_workflow_options(), [:workspace, :source_repo_map]) || %{}
+
+    %{
+      default: normalize_source_repo_values(Map.get(source_repo_map, :default)),
+      label_overrides:
+        source_repo_map
+        |> Map.get(:label_overrides, %{})
+        |> Enum.reduce(%{}, fn {label, repo}, acc ->
+          normalized_label = normalize_issue_state(to_string(label))
+          normalized_repos = normalize_source_repo_values(repo)
+
+          cond do
+            normalized_label == "" -> acc
+            normalized_repos == [] -> acc
+            true -> Map.put(acc, normalized_label, normalized_repos)
+          end
+        end)
+    }
+  end
+
+  @spec workspace_source_repos_for_labels([String.t()] | nil) :: [String.t()]
+  def workspace_source_repos_for_labels(labels) when is_list(labels) do
+    source_repo_map = workspace_source_repo_map()
+
+    overrides =
+      labels
+      |> Enum.map(fn
+        label when is_binary(label) -> normalize_issue_state(label)
+        label when is_atom(label) -> label |> Atom.to_string() |> normalize_issue_state()
+        _other -> ""
+      end)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.reduce([], fn label, repos ->
+        repos ++ Map.get(source_repo_map.label_overrides, label, [])
+      end)
+      |> uniq_strings()
+
+    case overrides do
+      [] -> source_repo_map.default
+      repos -> repos
+    end
+  end
+
+  def workspace_source_repos_for_labels(_labels), do: workspace_source_repo_map().default
+
+  @spec workspace_source_repo_for_labels([String.t()] | nil) :: String.t() | nil
+  def workspace_source_repo_for_labels(labels),
+    do: workspace_source_repos_for_labels(labels) |> List.first()
 
   @spec workspace_hooks() :: workspace_hooks()
   def workspace_hooks do
@@ -571,6 +640,7 @@ defmodule SymphonyElixir.Config do
   defp extract_workspace_options(section) do
     %{}
     |> put_if_present(:root, binary_value(Map.get(section, "root")))
+    |> put_if_present(:source_repo_map, source_repo_map_value(Map.get(section, "source_repo_map")))
   end
 
   defp extract_agent_options(section) do
@@ -800,6 +870,53 @@ defmodule SymphonyElixir.Config do
 
   defp token_budget_value(_value), do: :omit
 
+  defp source_repo_map_value(value) when is_map(value) do
+    %{}
+    |> put_if_present(:default, source_repo_value(map_get_any(value, ["default", :default])))
+    |> put_if_present(
+      :label_overrides,
+      source_repo_label_overrides_value(map_get_any(value, ["label_overrides", :label_overrides]))
+    )
+  end
+
+  defp source_repo_map_value(_value), do: :omit
+
+  defp source_repo_label_overrides_value(value) when is_map(value) do
+    value
+    |> Enum.reduce(%{}, fn {label, repo}, acc ->
+      normalized_label = normalize_issue_state(to_string(label))
+      normalized_repo = source_repo_value(repo)
+
+      cond do
+        normalized_label == "" -> acc
+        normalized_repo == :omit -> acc
+        true -> Map.put(acc, normalized_label, normalized_repo)
+      end
+    end)
+    |> case do
+      map when map_size(map) == 0 -> :omit
+      map -> map
+    end
+  end
+
+  defp source_repo_label_overrides_value(_value), do: :omit
+
+  defp source_repo_value(value) when is_binary(value), do: command_value(value)
+
+  defp source_repo_value(value) when is_list(value) do
+    value
+    |> Enum.map(&command_value/1)
+    |> Enum.reject(&(&1 == :omit))
+    |> uniq_strings()
+    |> case do
+      [] -> :omit
+      [single] -> single
+      repos -> repos
+    end
+  end
+
+  defp source_repo_value(_value), do: :omit
+
   defp map_get_any(map, keys) when is_map(map) and is_list(keys) do
     Enum.find_value(keys, fn key ->
       if Map.has_key?(map, key), do: {:ok, Map.get(map, key)}, else: nil
@@ -1006,6 +1123,32 @@ defmodule SymphonyElixir.Config do
     else
       Path.expand(workspace_root())
     end
+  end
+
+  defp normalize_source_repo_values(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> []
+      trimmed -> [trimmed]
+    end
+  end
+
+  defp normalize_source_repo_values(values) when is_list(values) do
+    values
+    |> Enum.flat_map(&normalize_source_repo_values/1)
+    |> uniq_strings()
+  end
+
+  defp normalize_source_repo_values(_value), do: []
+
+  defp uniq_strings(values) when is_list(values) do
+    values
+    |> Enum.reduce([], fn value, acc ->
+      if is_binary(value) and String.trim(value) != "" and not Enum.member?(acc, value) do
+        acc ++ [value]
+      else
+        acc
+      end
+    end)
   end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do

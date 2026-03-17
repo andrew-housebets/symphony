@@ -303,7 +303,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
                               <span class="log-panel-title">session log</span>
                               <span class="log-panel-meta"><%= entry.issue_identifier %></span>
                             </div>
-                            <pre class="log-content" id={"stdout-#{entry.issue_identifier}"} phx-hook="ScrollBottom"><%= Map.get(@stdout_open, entry.issue_identifier, "") %></pre>
+                            <.render_stdout_timeline
+                              issue_identifier={entry.issue_identifier}
+                              timeline={Map.get(@stdout_open, entry.issue_identifier, empty_stdout_timeline())}
+                            />
                           </div>
                         </td>
                       </tr>
@@ -659,6 +662,59 @@ defmodule SymphonyElixirWeb.DashboardLive do
     """
   end
 
+  defp render_stdout_timeline(assigns) do
+    timeline = assigns.timeline || empty_stdout_timeline()
+    assigns = assign(assigns, :timeline, timeline)
+
+    ~H"""
+    <div class="log-content timeline-content" id={"stdout-#{@issue_identifier}"}>
+      <%= if @timeline.total == 0 do %>
+        <p class="empty">No log entries yet.</p>
+      <% else %>
+        <.render_timeline_items entries={@timeline.root} />
+
+        <div :if={@timeline.sub_agents != []} class="timeline-subagent-group">
+          <details :for={lane <- @timeline.sub_agents} class="timeline-lane">
+            <summary class="timeline-lane-summary">
+              <span class="timeline-lane-title">Sub-agent <%= short_timeline_id(lane.thread_id) %></span>
+              <span class="timeline-lane-meta mono"><%= lane.thread_id %> · <%= length(lane.entries) %> events</span>
+            </summary>
+            <.render_timeline_items entries={lane.entries} nested={true} />
+          </details>
+        </div>
+      <% end %>
+    </div>
+    """
+  end
+
+  defp render_timeline_items(assigns) do
+    assigns =
+      assigns
+      |> assign_new(:nested, fn -> false end)
+      |> assign(:list_class, if(assigns[:nested], do: "timeline-list timeline-list-nested", else: "timeline-list"))
+
+    ~H"""
+    <ol class={@list_class}>
+      <li :for={entry <- @entries} class="timeline-node">
+        <details class={timeline_item_class(entry.kind)}>
+          <summary class="timeline-summary">
+            <span class={timeline_kind_badge_class(entry.kind)}><%= timeline_kind_label(entry.kind) %></span>
+            <span class="timeline-summary-text"><%= entry.summary %></span>
+            <span class="timeline-summary-meta mono">
+              <%= format_timeline_time(entry.at) %><%= if entry.meta != "", do: " · #{entry.meta}" %>
+            </span>
+          </summary>
+
+          <div class="timeline-body">
+            <pre :if={entry.text != ""} class="timeline-pre"><%= entry.text %></pre>
+            <pre :if={entry.details != "" and entry.details != entry.text} class="timeline-pre timeline-pre-secondary"><%= entry.details %></pre>
+          </div>
+        </details>
+      </li>
+    </ol>
+    """
+  end
+
   # ── Data helpers ───────────────────────────────────────────────────
 
   defp load_payload do
@@ -676,10 +732,244 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp fetch_stdout(issue_identifier) do
     issue_identifier
     |> SymphonyElixir.SessionLog.read_all()
-    |> Enum.map(&format_stdout_entry/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.join("\n")
+    |> build_stdout_timeline()
   end
+
+  defp empty_stdout_timeline do
+    %{total: 0, root: [], sub_agents: []}
+  end
+
+  defp build_stdout_timeline(entries) when is_list(entries) do
+    normalized =
+      entries
+      |> Enum.with_index()
+      |> Enum.map(&normalize_timeline_entry/1)
+      |> Enum.reject(&is_nil/1)
+
+    primary_thread_id = primary_timeline_thread_id(normalized)
+
+    {root_rev, subagent_map} =
+      Enum.reduce(normalized, {[], %{}}, fn entry, {root_acc, lane_acc} ->
+        cond do
+          is_binary(entry.thread_id) and entry.thread_id != "" and entry.thread_id != primary_thread_id ->
+            {root_acc, Map.update(lane_acc, entry.thread_id, [entry], fn existing -> [entry | existing] end)}
+
+          true ->
+            {[entry | root_acc], lane_acc}
+        end
+      end)
+
+    sub_agents =
+      subagent_map
+      |> Enum.map(fn {thread_id, lane_entries} ->
+        %{thread_id: thread_id, entries: Enum.reverse(lane_entries)}
+      end)
+      |> Enum.sort_by(fn lane ->
+        case lane.entries do
+          [%{seq: seq} | _] -> seq
+          _ -> 0
+        end
+      end)
+
+    %{
+      total: length(normalized),
+      root: Enum.reverse(root_rev),
+      sub_agents: sub_agents
+    }
+  end
+
+  defp build_stdout_timeline(_), do: empty_stdout_timeline()
+
+  defp normalize_timeline_entry({entry, seq}) when is_map(entry) and is_integer(seq) do
+    text = timeline_value(entry, [:text, "text"]) || ""
+    details = timeline_value(entry, [:details, "details"]) || ""
+    method = timeline_value(entry, [:method, "method"]) || ""
+    event = timeline_value(entry, [:event, "event"]) || ""
+    kind = timeline_kind_value(entry)
+    thread_id = timeline_value(entry, [:thread_id, "thread_id"]) || ""
+    turn_id = timeline_value(entry, [:turn_id, "turn_id"]) || ""
+    tool = timeline_value(entry, [:tool, "tool"]) || ""
+
+    body = String.trim(text)
+    details = String.trim(details)
+
+    if body == "" and details == "" do
+      nil
+    else
+      summary = timeline_summary(body, details, method, event)
+      meta = timeline_meta_text(method, event, thread_id, turn_id, tool)
+
+      %{
+        seq: seq,
+        at: timeline_value(entry, [:at, "at"]),
+        summary: summary,
+        text: body,
+        details: details,
+        method: method,
+        event: event,
+        kind: kind,
+        thread_id: thread_id,
+        turn_id: turn_id,
+        tool: tool,
+        meta: meta
+      }
+    end
+  end
+
+  defp normalize_timeline_entry(_), do: nil
+
+  defp primary_timeline_thread_id(entries) when is_list(entries) do
+    Enum.find_value(entries, fn
+      %{kind: "session", thread_id: thread_id} when is_binary(thread_id) and thread_id != "" -> thread_id
+      _ -> nil
+    end) ||
+      Enum.find_value(entries, fn
+        %{thread_id: thread_id} when is_binary(thread_id) and thread_id != "" -> thread_id
+        _ -> nil
+      end)
+  end
+
+  defp primary_timeline_thread_id(_), do: nil
+
+  defp timeline_summary(body, details, method, event) do
+    candidate =
+      cond do
+        body != "" ->
+          body
+
+        details != "" ->
+          details
+
+        method != "" ->
+          method
+
+        event != "" ->
+          event
+
+        true ->
+          "log event"
+      end
+
+    truncate_timeline_text(candidate, 180)
+  end
+
+  defp timeline_meta_text(method, event, thread_id, turn_id, tool) do
+    [method, event, compact_timeline_id(thread_id), compact_timeline_id(turn_id), tool]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(" · ")
+  end
+
+  defp timeline_value(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, fn key ->
+      if Map.has_key?(map, key), do: Map.get(map, key)
+    end)
+    |> case do
+      value when is_binary(value) -> value
+      value when is_integer(value) -> Integer.to_string(value)
+      value when is_float(value) -> Float.to_string(value)
+      _ -> nil
+    end
+  end
+
+  defp timeline_value(_map, _keys), do: nil
+
+  defp timeline_kind_value(entry) do
+    case timeline_value(entry, [:kind, "kind"]) do
+      nil -> "event"
+      "" -> "event"
+      value -> value
+    end
+  end
+
+  defp truncate_timeline_text(text, max_len) when is_binary(text) and is_integer(max_len) and max_len > 3 do
+    compact = text |> String.replace("\n", " ") |> String.trim()
+
+    if String.length(compact) > max_len do
+      String.slice(compact, 0, max_len - 1) <> "…"
+    else
+      compact
+    end
+  end
+
+  defp truncate_timeline_text(_text, _max_len), do: ""
+
+  defp compact_timeline_id(id) when is_binary(id) do
+    trimmed = String.trim(id)
+
+    cond do
+      trimmed == "" ->
+        ""
+
+      String.length(trimmed) > 16 ->
+        String.slice(trimmed, 0, 8) <> "…" <> String.slice(trimmed, -6, 6)
+
+      true ->
+        trimmed
+    end
+  end
+
+  defp compact_timeline_id(_id), do: ""
+
+  defp short_timeline_id(id) when is_binary(id) do
+    trimmed = String.trim(id)
+
+    if trimmed == "" do
+      "thread"
+    else
+      compact_timeline_id(trimmed)
+    end
+  end
+
+  defp short_timeline_id(_id), do: "thread"
+
+  defp format_timeline_time(nil), do: "time n/a"
+
+  defp format_timeline_time(iso_timestamp) when is_binary(iso_timestamp) do
+    case DateTime.from_iso8601(iso_timestamp) do
+      {:ok, dt, _offset} -> Calendar.strftime(dt, "%H:%M:%S")
+      _ -> truncate_timeline_text(iso_timestamp, 22)
+    end
+  end
+
+  defp format_timeline_time(_), do: "time n/a"
+
+  defp timeline_item_class(kind), do: "timeline-item timeline-item-#{timeline_kind_slug(kind)}"
+
+  defp timeline_kind_badge_class(kind), do: "timeline-kind timeline-kind-#{timeline_kind_slug(kind)}"
+
+  defp timeline_kind_label(kind) when is_binary(kind) do
+    case String.downcase(kind) do
+      "session" -> "session"
+      "reasoning" -> "reasoning"
+      "message" -> "message"
+      "command" -> "command"
+      "tool" -> "tool"
+      "file_change" -> "file"
+      "plan" -> "plan"
+      "token" -> "tokens"
+      "malformed" -> "raw"
+      _ -> "event"
+    end
+  end
+
+  defp timeline_kind_label(_), do: "event"
+
+  defp timeline_kind_slug(kind) when is_binary(kind) do
+    case String.downcase(kind) do
+      "session" -> "session"
+      "reasoning" -> "reasoning"
+      "message" -> "message"
+      "command" -> "command"
+      "tool" -> "tool"
+      "file_change" -> "file"
+      "plan" -> "plan"
+      "token" -> "token"
+      "malformed" -> "malformed"
+      _ -> "event"
+    end
+  end
+
+  defp timeline_kind_slug(_), do: "event"
 
   defp refresh_open_stdout(socket) do
     stdout_open = socket.assigns.stdout_open
@@ -793,10 +1083,6 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp format_completed_at(%DateTime{} = dt), do: Calendar.strftime(dt, "%H:%M:%S")
   defp format_completed_at(_), do: "n/a"
-
-  defp format_stdout_entry(%{text: text}) when is_binary(text), do: text
-  defp format_stdout_entry(%{"text" => text}) when is_binary(text), do: text
-  defp format_stdout_entry(_), do: ""
 
   # ── Badge/class helpers ────────────────────────────────────────────
 

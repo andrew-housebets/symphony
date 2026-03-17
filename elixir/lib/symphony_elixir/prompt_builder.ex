@@ -44,6 +44,10 @@ defmodule SymphonyElixir.PromptBuilder do
         "- Target budget: keep this turn under #{format_integer(settings.per_turn_soft_tokens)} tokens and this run under #{format_integer(settings.per_run_soft_tokens)} tokens when possible.",
         "- Hard caps: #{format_integer(settings.per_turn_hard_tokens)} tokens per turn, #{format_integer(settings.per_run_hard_tokens)} tokens per run, and #{format_integer(settings.per_issue_window_hard_tokens)} tokens per issue over #{settings.issue_window_seconds}s.",
         maybe_live_budget_line(run_total_tokens, remaining_run_hard, remaining_issue_window_hard),
+        "- Delegation policy (required): delegate bounded discovery/verification tasks to sub-agents by default; keep the main thread as an orchestrator that only receives concise summaries.",
+        "- Delegation trigger (required): if a sub-problem would take more than 5 tool/command calls or more than 2 file reads, call `spawn_agent` first and continue from the sub-agent summary.",
+        "- Keep command output small by default: set `max_output_tokens` on command tools (about 600-1200 unless debugging a specific failure).",
+        "- Prefer targeted reads (`rg` + narrow `sed`/`head`) over whole-file or repo-wide dumps, and avoid re-reading the same file range unless it changed.",
         "- Be concise: do not restate ticket context unnecessarily, keep plans short, and summarize tool output unless the raw detail is necessary to act."
       ]
       |> Enum.reject(&is_nil/1)

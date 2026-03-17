@@ -168,6 +168,88 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert [%{"text" => "stdout line from codex"}] = log_entries
   end
 
+  test "orchestrator persists structured stdout metadata for timeline rendering" do
+    issue_id = "issue-snapshot-stdout-metadata"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-190",
+      title: "Snapshot stdout metadata test",
+      description: "Capture structured stdout metadata",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-190"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :SnapshotStdoutMetadataOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    SymphonyElixir.SessionLog.reset(issue.identifier)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    timestamp = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "item/tool/call",
+           "params" => %{
+             "name" => "spawn_agent",
+             "threadId" => "thread-main",
+             "turnId" => "turn-main"
+           }
+         },
+         timestamp: timestamp
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.stdout_line_count == 1
+
+    log_entries = SymphonyElixir.SessionLog.read_all("MT-190")
+
+    assert [
+             %{
+               "kind" => "tool",
+               "method" => "item/tool/call",
+               "thread_id" => "thread-main",
+               "turn_id" => "turn-main",
+               "tool" => "spawn_agent",
+               "text" => "dynamic tool call requested (spawn_agent)"
+             }
+           ] = log_entries
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -1398,7 +1480,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert remaining_ms <= 91_000
   end
 
-  test "per-run hard token budget stops the worker, comments, and pauses the issue" do
+  test "per-run hard token budget restarts with continuation retry instead of pausing/suppressing" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       tracker_api_token: nil,
@@ -1474,13 +1556,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert_receive {:memory_tracker_comment, ^issue_id, comment_body}, 1_000
     assert comment_body =~ "per_run_hard_limit"
-
-    assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 1_000
+    assert comment_body =~ "queued a continuation retry with a fresh context"
 
     wait_for_snapshot(
       pid,
       fn snapshot ->
-        snapshot.running == [] and length(snapshot.token_budget.suppressed_issues) == 1
+        snapshot.running == [] and length(snapshot.retrying) == 1 and snapshot.token_budget.suppressed_issues == []
       end,
       1_000
     )
@@ -1489,12 +1570,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
-    refute Map.has_key?(state.retry_attempts, issue_id)
-    assert state.total_failed == initial_failed + 1
-    assert %{reason: "per_run_hard_limit"} = state.suppressed_issues[issue_id]
+    assert Map.has_key?(state.retry_attempts, issue_id)
+    assert state.total_failed >= initial_failed + 1
+    refute Map.has_key?(state.suppressed_issues, issue_id)
   end
 
-  test "per-run soft token budget suppresses continuation retry after a normal exit" do
+  test "per-run soft token budget remains advisory and still allows continuation retry after a normal exit" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
       token_budget: %{
@@ -1557,7 +1638,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         pid,
         fn
           %{running: [entry]} ->
-            :per_run_soft_limit in entry.budget_soft_limits and entry.budget_continuation_blocked
+            :per_run_soft_limit in entry.budget_soft_limits and not entry.budget_continuation_blocked
 
           _ ->
             false
@@ -1572,7 +1653,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert Map.has_key?(state.retry_attempts, issue_id)
+    refute Map.has_key?(state.suppressed_issues, issue_id)
     assert state.total_completed == initial_completed + 1
 
     assert [%{issue_id: ^issue_id, outcome: :success} | _] = state.completed_sessions

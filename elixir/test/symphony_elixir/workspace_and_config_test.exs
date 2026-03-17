@@ -215,6 +215,110 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace bootstraps from source repo map with label overrides" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-source-repo-map-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      backend_repo = Path.join(test_root, "backend")
+      frontend_repo = Path.join(test_root, "frontend")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(backend_repo)
+      File.mkdir_p!(frontend_repo)
+
+      File.write!(Path.join(backend_repo, "README.md"), "backend repo\n")
+      File.write!(Path.join(frontend_repo, "README.md"), "frontend repo\n")
+
+      System.cmd("git", ["-C", backend_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", backend_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", backend_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", backend_repo, "add", "README.md"])
+      System.cmd("git", ["-C", backend_repo, "commit", "-m", "backend initial"])
+
+      System.cmd("git", ["-C", frontend_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", frontend_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", frontend_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", frontend_repo, "add", "README.md"])
+      System.cmd("git", ["-C", frontend_repo, "commit", "-m", "frontend initial"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_source_repo_map: %{
+          default: backend_repo,
+          label_overrides: %{
+            frontend: frontend_repo
+          }
+        }
+      )
+
+      frontend_issue = %Issue{id: "issue-fe", identifier: "MT-FE", labels: ["frontend"]}
+      backend_issue = %Issue{id: "issue-be", identifier: "MT-BE", labels: ["backend"]}
+
+      assert {:ok, frontend_workspace} = Workspace.create_for_issue(frontend_issue)
+      assert {:ok, backend_workspace} = Workspace.create_for_issue(backend_issue)
+
+      assert File.read!(Path.join(frontend_workspace, "README.md")) == "frontend repo\n"
+      assert File.read!(Path.join(backend_workspace, "README.md")) == "backend repo\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace bootstraps all default repos when issue has no matching labels" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-source-repo-default-multi-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      backend_repo = Path.join(test_root, "backend-api")
+      frontend_repo = Path.join(test_root, "frontend")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(backend_repo)
+      File.mkdir_p!(frontend_repo)
+
+      File.write!(Path.join(backend_repo, "README.md"), "backend api repo\n")
+      File.write!(Path.join(frontend_repo, "README.md"), "frontend repo\n")
+
+      System.cmd("git", ["-C", backend_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", backend_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", backend_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", backend_repo, "add", "README.md"])
+      System.cmd("git", ["-C", backend_repo, "commit", "-m", "backend initial"])
+
+      System.cmd("git", ["-C", frontend_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", frontend_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", frontend_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", frontend_repo, "add", "README.md"])
+      System.cmd("git", ["-C", frontend_repo, "commit", "-m", "frontend initial"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_source_repo_map: %{
+          default: [backend_repo, frontend_repo],
+          label_overrides: %{
+            frontend: frontend_repo,
+            backend: backend_repo
+          }
+        }
+      )
+
+      unlabeled_issue = %Issue{id: "issue-multi", identifier: "MT-MULTI", labels: []}
+      assert {:ok, workspace} = Workspace.create_for_issue(unlabeled_issue)
+
+      assert File.read!(Path.join(workspace, "README.md")) == "backend api repo\n"
+      assert File.read!(Path.join([workspace, "frontend", "README.md"])) == "frontend repo\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace removes all workspaces for a closed issue identifier" do
     workspace_root =
       Path.join(
@@ -684,6 +788,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.linear_api_token() == nil
     assert Config.linear_project_slug() == nil
     assert Config.workspace_root() == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert Config.workspace_source_repo_map() == %{default: [], label_overrides: %{}}
     assert Config.max_concurrent_agents() == 10
     assert Config.continuation_retry_ms() == 60_000
 
@@ -732,6 +837,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_approval_policy: "on-request",
       codex_thread_sandbox: "workspace-write",
       codex_turn_sandbox_policy: %{type: "workspaceWrite", writableRoots: ["/tmp/workspace", "/tmp/cache"]},
+      workspace_source_repo_map: %{
+        default: "git@github.com:housebets/arbitrium.git",
+        label_overrides: %{frontend: "git@github.com:housebets/arbitrium-ui.git"}
+      },
       token_budget: %{
         enabled: false,
         per_turn_soft_tokens: 12_345,
@@ -748,6 +857,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert Config.codex_approval_policy() == "on-request"
     assert Config.codex_thread_sandbox() == "workspace-write"
+
+    assert Config.workspace_source_repo_map() == %{
+             default: ["git@github.com:housebets/arbitrium.git"],
+             label_overrides: %{"frontend" => ["git@github.com:housebets/arbitrium-ui.git"]}
+           }
+
+    assert Config.workspace_source_repos_for_labels(["frontend"]) == ["git@github.com:housebets/arbitrium-ui.git"]
+    assert Config.workspace_source_repos_for_labels(["backend"]) == ["git@github.com:housebets/arbitrium.git"]
+    assert Config.workspace_source_repo_for_labels(["frontend"]) == "git@github.com:housebets/arbitrium-ui.git"
+    assert Config.workspace_source_repo_for_labels(["backend"]) == "git@github.com:housebets/arbitrium.git"
 
     assert Config.codex_turn_sandbox_policy() == %{
              "type" => "workspaceWrite",
@@ -814,6 +933,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},
       workspace_root: 123,
+      workspace_source_repo_map: "bad",
       max_retry_backoff_ms: 0,
       continuation_retry_ms: 0,
       token_budget: %{
@@ -842,6 +962,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.linear_terminal_states() == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert Config.poll_interval_ms() == 30_000
     assert Config.workspace_root() == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert Config.workspace_source_repo_map() == %{default: [], label_overrides: %{}}
     assert Config.max_retry_backoff_ms() == 300_000
     assert Config.continuation_retry_ms() == 60_000
 

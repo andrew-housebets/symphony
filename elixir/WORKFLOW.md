@@ -6,6 +6,7 @@ tracker:
     - Todo
     - In Progress
     - Rework
+    - AI Review
     - Resolve PR Comments
     - Human Review
     - Merging
@@ -20,24 +21,43 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+  source_repo_map:
+    default:
+      - git@github.com:arbitrium-platform/arbitrium-backend.git
+      - git@github.com:arbitrium-platform/arbitrium-frontend.git
+    label_overrides:
+      backend: git@github.com:arbitrium-platform/arbitrium-backend.git
+      backend-api: git@github.com:arbitrium-platform/arbitrium-backend.git
+      frontend: git@github.com:arbitrium-platform/arbitrium-frontend.git
 hooks:
   after_create: |
-    if [ -d /Users/andrewgower/Development/housebets/arbitrium/.git ]; then
-      git clone --depth 1 /Users/andrewgower/Development/housebets/arbitrium .
-      git remote set-url origin git@github.com:andrew-housebets/arbitrium.git
-    else
-      git clone --depth 1 git@github.com:andrew-housebets/arbitrium.git .
+    if [ -f go.mod ]; then
+      go mod download
     fi
-    go mod download
-    npm --prefix frontend ci --legacy-peer-deps
-    npm --prefix backoffice ci
+    if [ -f frontend/package.json ]; then
+      npm --prefix frontend ci --legacy-peer-deps
+    fi
+    if [ -f backoffice/package.json ]; then
+      npm --prefix backoffice ci
+    fi
   before_remove: |
     true
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  token_budget:
+    enabled: true
+    per_turn_soft_tokens: 180000
+    per_turn_hard_tokens: 900000
+    per_run_soft_tokens: 350000
+    per_run_hard_tokens: 1200000
+    per_issue_window_soft_tokens: 2500000
+    per_issue_window_hard_tokens: 6000000
+    issue_window_seconds: 86400
+    comment_on_enforcement: true
+    pause_on_hard_limit: false
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=high --model gpt-5.3-codex app-server
+  command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=medium --model gpt-5.3-codex app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
@@ -78,7 +98,7 @@ Instructions:
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
 
-Work only in the provided repository copy. Do not touch any other path.
+Work only inside the provided workspace and repositories copied into it. Do not touch any other path.
 
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 
@@ -104,6 +124,10 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
+- Treat the main thread as orchestrator: delegate bounded discovery/verification tasks to sub-agents by default, then consume only concise summaries.
+- Delegation trigger (required): if a sub-problem would take more than 5 tool/command calls or more than 2 file reads, call `spawn_agent` first and continue from the sub-agent summary.
+- Keep token usage lean: avoid large raw dumps, prefer targeted reads/searches, and cap command output by default unless debugging a specific failure.
+- If multiple repositories are present in the workspace, apply branch/commit/push/PR hygiene per repository you modify.
 
 ## Related skills
 
@@ -119,6 +143,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `Todo` -> queued; ensure branch policy/alignment first, then transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
+- `AI Review` -> run the required `/review` loop against `main`, resolve findings, and return to `In Progress` for fixes or advance to `Human Review` when clear.
 - `Resolve PR Comments` -> human-triggered feedback pass; address outstanding PR comments/reviews, revalidate, and return to `Human Review`.
 - `Human Review` -> PR is attached and validated; waiting on human action (`Resolve PR Comments` for changes or `Merging` for approval).
 - `Merging` -> approved by human; run `land` to squash-merge, clean workspace, then move to `Done`.
@@ -134,6 +159,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
+   - `AI Review` -> continue/complete the `/review` loop against `main`; resolve findings, then proceed with normal pre-`Human Review` gates.
    - `Resolve PR Comments` -> run PR feedback resolution loop, then return to `Human Review` once clear.
    - `Human Review` -> wait and poll for decision/review updates; do not change state from `Human Review`.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; squash-merge, clean workspace, then move to `Done`.
@@ -202,6 +228,23 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 5. Re-run validation after feedback-driven changes and push updates.
 6. Repeat this sweep until there are no outstanding actionable comments.
 
+## Code review loop (required)
+
+Before moving any issue to `Human Review`, run a dedicated `/review` loop against `main`:
+
+1. Refresh main and compute the merge base commit:
+   - `git fetch origin --prune`
+   - `BASE=$(git merge-base HEAD origin/main || git merge-base HEAD main)`
+2. Invoke `/review` using this prompt template (replace `<BASE>`):
+   - `Review the code changes against the base branch 'main'. The merge base commit for this comparison is <BASE>. Run \`git diff <BASE>\` to inspect the changes relative to main. Provide prioritized, actionable findings.`
+3. Treat actionable findings as strictly blocking:
+   - If `/review` returns any actionable items, do not proceed to `Human Review`.
+   - Apply fixes (or record explicit, justified pushback when appropriate).
+   - Re-run required validation.
+   - Re-run `/review` with the same base-branch comparison.
+4. Repeat step 3 continuously until `/review` returns zero actionable items.
+5. Exit the loop only when there are no unresolved actionable findings from the latest `/review` pass.
+
 ## Human Review entry gate (hard requirement)
 
 Before moving any issue to `Human Review`, all of the following must be true for the latest PR head commit:
@@ -216,7 +259,11 @@ Before moving any issue to `Human Review`, all of the following must be true for
 3. Bot-review settle window is complete:
    - After the latest push, wait long enough for asynchronous bot reviews to appear, then run one final full feedback+checks sweep.
    - If any new bot feedback appears, address it and repeat the gate.
-4. If any gate condition fails, do not move to `Human Review`; remain in `In Progress` and continue the fix loop.
+4. `/review` loop is complete:
+   - `/review` was run against `main` using merge-base diff (`git diff <BASE>`).
+   - The agent stayed in the fix-and-re-review loop until `/review` returned zero actionable findings.
+   - No unresolved actionable findings remain from the latest `/review` pass.
+5. If any gate condition fails, do not move to `Human Review`; remain in `In Progress` and continue the fix loop.
 
 ## Blocked-access escape hatch (required behavior)
 
@@ -230,7 +277,7 @@ Use this only when completion is blocked by missing required tools or missing au
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
-## Step 2: Execution phase (Todo -> In Progress -> Resolve PR Comments -> Human Review)
+## Step 2: Execution phase (Todo -> In Progress -> AI Review -> Resolve PR Comments -> Human Review)
 
 1. Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
    - If `git branch --show-current` does not match Linear `issue.branchName`, stop and fix branch alignment first.
@@ -254,8 +301,9 @@ Use this only when completion is blocked by missing required tools or missing au
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
 6. Re-check all acceptance criteria and close any gaps.
 7. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-8. Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
-    - Ensure the GitHub PR has label `symphony` (add it if missing).
+8. Attach PR URL(s) to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
+    - If multiple repositories were modified, open and attach one PR per modified repository.
+    - Ensure each GitHub PR has label `symphony` (add it if missing).
 9. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
 10. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.
@@ -264,14 +312,18 @@ Use this only when completion is blocked by missing required tools or missing au
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
 11. Before moving to `Human Review`, poll PR feedback and checks:
+    - Move the issue to `AI Review` before running the required `/review` loop.
+      - If `AI Review` transition fails because the state is unavailable in Linear, continue in `In Progress` and record the fallback in the workpad `Notes`.
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
+    - Run the required `/review` loop against `main` (merge-base + `git diff <BASE>`), and resolve findings before proceeding.
+      - Continue fixing and rerunning `/review` until it returns zero actionable items.
     - Run the full PR feedback sweep protocol.
     - Confirm PR checks are fully complete and passing (no failed, no pending/in-progress) for the latest head SHA.
     - Wait for bot-review settle window after the latest push, then re-run the full sweep once more.
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding actionable comments remain and all checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review`.
+12. Only then move issue to `Human Review` from `AI Review` (or from `In Progress` when `AI Review` is unavailable).
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
@@ -306,6 +358,8 @@ Use this only when completion is blocked by missing required tools or missing au
 - Step 1/2 checklist is fully complete and accurately reflected in the single workpad comment.
 - Acceptance criteria and required ticket-provided validation items are complete.
 - Validation/tests are green for the latest commit.
+- Required `/review` loop against `main` is complete with no unresolved actionable findings.
+- Issue moved through `AI Review` for the `/review` loop, or documented fallback when `AI Review` state is unavailable.
 - PR feedback sweep is complete and no actionable comments remain (including bot comments/reviews).
 - PR checks are complete and green for latest head SHA (no pending/in-progress checks), branch is pushed, and PR is linked on the issue.
 - Bot-review settle window completed after latest push with a final clean sweep.

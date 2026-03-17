@@ -127,15 +127,18 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Treat the main thread as orchestrator: delegate bounded discovery/verification tasks to sub-agents by default, then consume only concise summaries.
 - Delegation trigger (required): if a sub-problem would take more than 5 tool/command calls or more than 2 file reads, call `spawn_agent` first and continue from the sub-agent summary.
 - Keep token usage lean: avoid large raw dumps, prefer targeted reads/searches, and cap command output by default unless debugging a specific failure.
+- Ticket pickup rule (required): whenever a ticket is picked up (from `Todo`, `In Progress`, or `Rework` restart), start by running the `tdd` skill (`$tdd`) before implementation.
 - If multiple repositories are present in the workspace, apply branch/commit/push/PR hygiene per repository you modify.
 
 ## Related skills
 
 - `linear`: interact with Linear.
+- `tdd`: start every ticket pickup with red-green-refactor discipline before implementation.
 - `commit`: produce clean, logical commits during implementation.
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
 - `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md` for squash-merge + workspace cleanup.
+- Do not call `gh pr merge` directly; `land` is the only merge path in this workflow.
 
 ## Status map
 
@@ -156,9 +159,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 2. Read the current state.
 3. Route to the matching flow:
    - `Backlog` -> do not modify issue content/state; stop and wait for human to move it to `Todo`.
-   - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
+   - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow with mandatory `tdd` kickoff (`$tdd`).
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
-   - `In Progress` -> continue execution flow from current scratchpad comment.
+   - `In Progress` -> continue execution flow from current scratchpad comment, starting with mandatory `tdd` kickoff (`$tdd`) for this pickup session.
    - `AI Review` -> continue/complete the `/review` loop against `main`; resolve findings, then proceed with normal pre-`Human Review` gates.
    - `Resolve PR Comments` -> run PR feedback resolution loop, then return to `Human Review` once clear.
    - `Human Review` -> wait and poll for decision/review updates; do not change state from `Human Review`.
@@ -186,27 +189,30 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
     - If not found, create one workpad comment and use it for all updates.
     - Persist the workpad comment ID and only write progress updates to that ID.
 2. If arriving from `Todo`, do not delay on additional status transitions: the issue should already be `In Progress` before this step begins.
-3. Immediately reconcile the workpad before new edits:
+3. Before any implementation edits, run the `tdd` skill (`$tdd`) for this pickup session and capture the initial red/repro signal in the workpad `Notes`.
+   - If a suitable failing test already exists, record the exact command/output and proceed through green/refactor.
+   - If no automated test is feasible, document deterministic reproduction evidence and the validation guardrail you will use instead.
+4. Immediately reconcile the workpad before new edits:
     - Check off items that are already done.
     - Expand/fix the plan so it is comprehensive for current scope.
     - Ensure `Acceptance Criteria` and `Validation` are current and still make sense for the task.
-4. Start work by writing/updating a hierarchical plan in the workpad comment.
-5. Ensure the workpad includes a compact environment stamp at the top as a code fence line:
+5. Start work by writing/updating a hierarchical plan in the workpad comment.
+6. Ensure the workpad includes a compact environment stamp at the top as a code fence line:
     - Format: `<host>:<abs-workdir>@<short-sha>`
     - Example: `devbox-01:/home/dev-user/code/symphony-workspaces/MT-32@7bdde33bc`
     - Do not include metadata already inferable from Linear issue fields (`issue ID`, `status`, `branch`, `PR link`).
-6. Add explicit acceptance criteria and TODOs in checklist form in the same comment.
+7. Add explicit acceptance criteria and TODOs in checklist form in the same comment.
     - If changes are user-facing, include a UI walkthrough acceptance criterion that describes the end-to-end user path to validate.
     - If changes touch app files or app behavior, add explicit app-specific flow checks to `Acceptance Criteria` in the workpad (for example: launch path, changed interaction path, and expected result path).
     - If the ticket description/comment context includes `Validation`, `Test Plan`, or `Testing` sections, copy those requirements into the workpad `Acceptance Criteria` and `Validation` sections as required checkboxes (no optional downgrade).
-7. Run a principal-style self-review of the plan and refine it in the comment.
-8. Before implementing, capture a concrete reproduction signal and record it in the workpad `Notes` section (command/output, screenshot, or deterministic UI behavior).
-9. Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the pull/sync result in the workpad `Notes`.
+8. Run a principal-style self-review of the plan and refine it in the comment.
+9. Before implementing, capture a concrete reproduction signal and record it in the workpad `Notes` section (command/output, screenshot, or deterministic UI behavior).
+10. Run the `pull` skill to sync with latest `origin/main` before any code edits, then record the pull/sync result in the workpad `Notes`.
     - Include a `pull skill evidence` note with:
       - merge source(s),
       - result (`clean` or `conflicts resolved`),
       - resulting `HEAD` short SHA.
-10. Compact context and proceed to execution.
+11. Compact context and proceed to execution.
 
 ## PR feedback sweep protocol (required)
 
@@ -283,35 +289,36 @@ Use this only when completion is blocked by missing required tools or missing au
    - If `git branch --show-current` does not match Linear `issue.branchName`, stop and fix branch alignment first.
    - If the branch is missing or invalid, set Linear `branchName` and local branch to a conventional name (`build/`, `chore/`, `ci/`, `docs/`, `feat/`, `fix/`, `perf/`, `refactor/`, `revert/`, `style/`, or `test/`) before coding.
 2. If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
-3. Load the existing workpad comment and treat it as the active execution checklist.
+3. Confirm `tdd` kickoff evidence exists for this pickup session (`$tdd` + red/repro note in workpad) before continuing implementation.
+4. Load the existing workpad comment and treat it as the active execution checklist.
     - Edit it liberally whenever reality changes (scope, risks, validation approach, discovered tasks).
-4. Implement against the hierarchical TODOs and keep the comment current:
+5. Implement against the hierarchical TODOs and keep the comment current:
     - Check off completed items.
     - Add newly discovered items in the appropriate section.
     - Keep parent/child structure intact as scope evolves.
     - Update the workpad immediately after each meaningful milestone (for example: reproduction complete, code change landed, validation run, review feedback addressed).
     - Never leave completed work unchecked in the plan.
     - For tickets that started as `Todo` with an attached PR, run the full PR feedback sweep protocol immediately after kickoff and before new feature work.
-5. Run validation/tests required for the scope.
+6. Run validation/tests required for the scope.
     - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/ `Testing` requirements when present; treat unmet items as incomplete work.
     - Prefer a targeted proof that directly demonstrates the behavior you changed.
     - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
     - Revert every temporary proof edit before commit/push.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
-6. Re-check all acceptance criteria and close any gaps.
-7. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-8. Attach PR URL(s) to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
+7. Re-check all acceptance criteria and close any gaps.
+8. Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
+9. Attach PR URL(s) to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
     - If multiple repositories were modified, open and attach one PR per modified repository.
     - Ensure each GitHub PR has label `symphony` (add it if missing).
-9. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
-10. Update the workpad comment with final checklist status and validation notes.
+10. Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
+11. Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.
     - Add final handoff notes (commit + validation summary) in the same workpad comment.
     - Do not include PR URL in the workpad comment; keep PR linkage on the issue via attachment/link fields.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
-11. Before moving to `Human Review`, poll PR feedback and checks:
+12. Before moving to `Human Review`, poll PR feedback and checks:
     - Move the issue to `AI Review` before running the required `/review` loop.
       - If `AI Review` transition fails because the state is unavailable in Linear, continue in `In Progress` and record the fallback in the workpad `Notes`.
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
@@ -323,9 +330,9 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding actionable comments remain and all checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review` from `AI Review` (or from `In Progress` when `AI Review` is unavailable).
+13. Only then move issue to `Human Review` from `AI Review` (or from `In Progress` when `AI Review` is unavailable).
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
-13. For `Todo` tickets that already had a PR attached at kickoff:
+14. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
     - Then apply the same `Human Review entry gate (hard requirement)` before any state transition.
@@ -351,7 +358,7 @@ Use this only when completion is blocked by missing required tools or missing au
 6. Start over from the normal kickoff flow:
    - If current issue state is `Todo`, move it to `In Progress`; otherwise keep the current state.
    - Create a new bootstrap `## Codex Workpad` comment.
-   - Build a fresh plan/checklist and execute end-to-end.
+   - Run mandatory `tdd` kickoff (`$tdd`), then build a fresh plan/checklist and execute end-to-end.
 
 ## Completion bar before Human Review
 

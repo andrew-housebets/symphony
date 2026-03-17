@@ -92,10 +92,10 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
-    assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
-    assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+    assert Map.get(hooks, "after_create") =~ "go mod download"
+    assert Map.get(hooks, "after_create") =~ "npm --prefix frontend ci --legacy-peer-deps"
+    assert Map.get(hooks, "after_create") =~ "npm --prefix backoffice ci"
+    assert Map.get(hooks, "before_remove") =~ "true"
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
@@ -814,6 +814,7 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is an unattended orchestration session."
     assert prompt =~ "Only stop early for a true blocker"
     assert prompt =~ "Do not include \"next steps for user\""
+    assert prompt =~ "start every ticket pickup with red-green-refactor discipline"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"

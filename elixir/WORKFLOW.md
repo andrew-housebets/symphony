@@ -6,7 +6,7 @@ tracker:
     - Todo
     - In Progress
     - Rework
-    - AI Review
+    - Agent Review
     - Resolve PR Comments
     - Human Review
     - Merging
@@ -146,7 +146,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `Todo` -> queued; ensure branch policy/alignment first, then transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
-- `AI Review` -> run the required `/review` loop against `main`, resolve findings, and return to `In Progress` for fixes or advance to `Human Review` when clear.
+- `Agent Review` -> run the required `/review` loop against `main`, resolve findings, and return to `In Progress` for fixes or advance to `Human Review` when clear.
 - `Resolve PR Comments` -> human-triggered feedback pass; address outstanding PR comments/reviews, revalidate, and return to `Human Review`.
 - `Human Review` -> PR is attached and validated; waiting on human action (`Resolve PR Comments` for changes or `Merging` for approval).
 - `Merging` -> approved by human; run `land` to squash-merge, clean workspace, then move to `Done`.
@@ -162,7 +162,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow with mandatory `tdd` kickoff (`$tdd`).
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment, starting with mandatory `tdd` kickoff (`$tdd`) for this pickup session.
-   - `AI Review` -> continue/complete the `/review` loop against `main`; resolve findings, then proceed with normal pre-`Human Review` gates.
+   - `Agent Review` -> continue/complete the `/review` loop against `main`; resolve findings, then proceed with normal pre-`Human Review` gates.
    - `Resolve PR Comments` -> run PR feedback resolution loop, then return to `Human Review` once clear.
    - `Human Review` -> wait and poll for decision/review updates; do not change state from `Human Review`.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; squash-merge, clean workspace, then move to `Done`.
@@ -283,7 +283,7 @@ Use this only when completion is blocked by missing required tools or missing au
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
-## Step 2: Execution phase (Todo -> In Progress -> AI Review -> Resolve PR Comments -> Human Review)
+## Step 2: Execution phase (Todo -> In Progress -> Agent Review -> Resolve PR Comments -> Human Review)
 
 1. Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
    - If `git branch --show-current` does not match Linear `issue.branchName`, stop and fix branch alignment first.
@@ -319,8 +319,8 @@ Use this only when completion is blocked by missing required tools or missing au
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
 12. Before moving to `Human Review`, poll PR feedback and checks:
-    - Move the issue to `AI Review` before running the required `/review` loop.
-      - If `AI Review` transition fails because the state is unavailable in Linear, continue in `In Progress` and record the fallback in the workpad `Notes`.
+    - Move the issue to `Agent Review` before running the required `/review` loop.
+      - If `Agent Review` transition fails because the state is unavailable in Linear, continue in `In Progress` and record the fallback in the workpad `Notes`.
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
     - Run the required `/review` loop against `main` (merge-base + `git diff <BASE>`), and resolve findings before proceeding.
       - Continue fixing and rerunning `/review` until it returns zero actionable items.
@@ -330,7 +330,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding actionable comments remain and all checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-13. Only then move issue to `Human Review` from `AI Review` (or from `In Progress` when `AI Review` is unavailable).
+13. Only then move issue to `Human Review` from `Agent Review` (or from `In Progress` when `Agent Review` is unavailable).
     - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
 14. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
@@ -366,7 +366,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Acceptance criteria and required ticket-provided validation items are complete.
 - Validation/tests are green for the latest commit.
 - Required `/review` loop against `main` is complete with no unresolved actionable findings.
-- Issue moved through `AI Review` for the `/review` loop, or documented fallback when `AI Review` state is unavailable.
+- Issue moved through `Agent Review` for the `/review` loop, or documented fallback when `Agent Review` state is unavailable.
 - PR feedback sweep is complete and no actionable comments remain (including bot comments/reviews).
 - PR checks are complete and green for latest head SHA (no pending/in-progress checks), branch is pushed, and PR is linked on the issue.
 - Bot-review settle window completed after latest push with a final clean sweep.

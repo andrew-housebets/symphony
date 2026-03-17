@@ -1,7 +1,10 @@
 ---
 tracker:
   kind: linear
-  project_slug: "e25f672de3c0"
+  scope: team
+  team_key: "ARBP"
+  # scope: project
+  # project_slug: "e25f672de3c0"
   active_states:
     - Todo
     - In Progress
@@ -28,7 +31,9 @@ workspace:
     label_overrides:
       backend: git@github.com:arbitrium-platform/arbitrium-backend.git
       backend-api: git@github.com:arbitrium-platform/arbitrium-backend.git
+      backend repo: git@github.com:arbitrium-platform/arbitrium-backend.git
       frontend: git@github.com:arbitrium-platform/arbitrium-frontend.git
+      frontend repo: git@github.com:arbitrium-platform/arbitrium-frontend.git
 hooks:
   after_create: |
     if [ -f go.mod ]; then

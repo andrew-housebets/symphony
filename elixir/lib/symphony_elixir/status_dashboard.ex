@@ -393,23 +393,15 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_link_lines do
-    project_part =
-      case Config.linear_project_slug() do
-        project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
-
-        _ ->
-          colorize("n/a", @ansi_gray)
-      end
-
-    project_line = colorize("│ Project: ", @ansi_bold) <> project_part
+    {label, value} = linear_board_reference()
+    board_line = colorize("│ #{label}: ", @ansi_bold) <> value
 
     case dashboard_url() do
       url when is_binary(url) ->
-        [project_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
+        [board_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
 
       _ ->
-        [project_line]
+        [board_line]
     end
   end
 
@@ -427,7 +419,30 @@ defmodule SymphonyElixir.StatusDashboard do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
 
+  defp linear_board_reference do
+    case Config.linear_scope() do
+      "team" ->
+        case Config.linear_team_key() do
+          team_key when is_binary(team_key) and team_key != "" ->
+            {"Team", colorize(linear_team_url(team_key), @ansi_cyan)}
+
+          _ ->
+            {"Team", colorize("n/a", @ansi_gray)}
+        end
+
+      _ ->
+        case Config.linear_project_slug() do
+          project_slug when is_binary(project_slug) and project_slug != "" ->
+            {"Project", colorize(linear_project_url(project_slug), @ansi_cyan)}
+
+          _ ->
+            {"Project", colorize("n/a", @ansi_gray)}
+        end
+    end
+  end
+
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+  defp linear_team_url(team_key), do: "https://linear.app/team/#{team_key}"
 
   defp dashboard_url do
     dashboard_url(Config.server_host(), Config.server_port(), HttpServer.bound_port())

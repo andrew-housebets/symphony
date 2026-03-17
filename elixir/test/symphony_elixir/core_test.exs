@@ -15,6 +15,8 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.linear_active_states() == ["Todo", "In Progress"]
     assert Config.linear_paused_states() == ["Human Review"]
     assert Config.linear_terminal_states() == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    assert Config.linear_scope() == "project"
+    assert Config.linear_team_key() == nil
     assert Config.linear_assignee() == nil
     assert Config.agent_max_turns() == 20
 
@@ -44,6 +46,25 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :missing_linear_project_slug} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_scope: "team",
+      tracker_team_key: nil
+    )
+
+    assert {:error, :missing_linear_team_key} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_scope: "team",
+      tracker_team_key: "PLATFORM",
+      tracker_project_slug: nil
+    )
+
+    assert :ok = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_scope: "unknown")
+    assert {:error, {:invalid_linear_scope, "unknown"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_scope: "project",
       tracker_project_slug: "project",
       codex_command: ""
     )
@@ -86,6 +107,7 @@ defmodule SymphonyElixir.CoreTest do
     tracker = Map.get(config, "tracker", %{})
     assert is_map(tracker)
     assert Map.get(tracker, "kind") == "linear"
+    assert Map.get(tracker, "scope") == "project"
     assert is_binary(Map.get(tracker, "project_slug"))
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))

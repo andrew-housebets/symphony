@@ -9,9 +9,54 @@ defmodule SymphonyElixir.Linear.Client do
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
 
-  @query """
-  query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+  @project_query """
+  query SymphonyLinearPollByProject($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @team_query """
+  query SymphonyLinearPollByTeam($teamKey: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
       nodes {
         id
         identifier
@@ -120,18 +165,14 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
-    project_slug = Config.linear_project_slug()
-
     cond do
       is_nil(Config.linear_api_token()) ->
         {:error, :missing_linear_api_token}
 
-      is_nil(project_slug) ->
-        {:error, :missing_linear_project_slug}
-
       true ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, Config.linear_active_states(), assignee_filter)
+        with {:ok, scope_filter} <- configured_scope_filter(),
+             {:ok, assignee_filter} <- routing_assignee_filter() do
+          do_fetch_by_states(scope_filter, Config.linear_active_states(), assignee_filter)
         end
     end
   end
@@ -143,17 +184,14 @@ defmodule SymphonyElixir.Linear.Client do
     if normalized_states == [] do
       {:ok, []}
     else
-      project_slug = Config.linear_project_slug()
-
       cond do
         is_nil(Config.linear_api_token()) ->
           {:error, :missing_linear_api_token}
 
-        is_nil(project_slug) ->
-          {:error, :missing_linear_project_slug}
-
         true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+          with {:ok, scope_filter} <- configured_scope_filter() do
+            do_fetch_by_states(scope_filter, normalized_states, nil)
+          end
       end
     end
   end
@@ -247,25 +285,51 @@ defmodule SymphonyElixir.Linear.Client do
     |> finalize_paginated_issues()
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  defp configured_scope_filter do
+    case Config.linear_scope() do
+      "project" ->
+        case Config.linear_project_slug() do
+          project_slug when is_binary(project_slug) and project_slug != "" ->
+            {:ok, {:project, project_slug}}
+
+          _ ->
+            {:error, :missing_linear_project_slug}
+        end
+
+      "team" ->
+        case Config.linear_team_key() do
+          team_key when is_binary(team_key) and team_key != "" ->
+            {:ok, {:team, team_key}}
+
+          _ ->
+            {:error, :missing_linear_team_key}
+        end
+
+      other ->
+        {:error, {:invalid_linear_scope, other}}
+    end
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_by_states(scope_filter, state_names, assignee_filter) do
+    do_fetch_by_states_page(scope_filter, state_names, assignee_filter, nil, [])
+  end
+
+  defp do_fetch_by_states_page(scope_filter, state_names, assignee_filter, after_cursor, acc_issues) do
+    {query, scope_variables} = poll_query_and_scope_variables(scope_filter)
+
     with {:ok, body} <-
-           graphql(@query, %{
-             projectSlug: project_slug,
+           graphql(query, %{
              stateNames: state_names,
              first: @issue_page_size,
              relationFirst: @issue_page_size,
              after: after_cursor
-           }),
+           } |> Map.merge(scope_variables)),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(scope_filter, state_names, assignee_filter, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -274,6 +338,15 @@ defmodule SymphonyElixir.Linear.Client do
           {:error, reason}
       end
     end
+  end
+
+  defp poll_query_and_scope_variables({:project, project_slug})
+       when is_binary(project_slug) do
+    {@project_query, %{projectSlug: project_slug}}
+  end
+
+  defp poll_query_and_scope_variables({:team, team_key}) when is_binary(team_key) do
+    {@team_query, %{teamKey: team_key}}
   end
 
   defp prepend_page_issues(issues, acc_issues) when is_list(issues) and is_list(acc_issues) do

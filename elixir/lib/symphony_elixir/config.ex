@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Config do
   @default_active_states ["Todo", "In Progress"]
   @default_paused_states ["Human Review"]
   @default_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+  @default_tracker_scope "project"
   @default_linear_endpoint "https://api.linear.app/graphql"
   @default_prompt_template """
   You are working on a Linear issue.
@@ -66,7 +67,9 @@ defmodule SymphonyElixir.Config do
                                  kind: [type: {:or, [:string, nil]}, default: nil],
                                  endpoint: [type: :string, default: @default_linear_endpoint],
                                  api_key: [type: {:or, [:string, nil]}, default: nil],
+                                 scope: [type: {:or, [:string, nil]}, default: @default_tracker_scope],
                                  project_slug: [type: {:or, [:string, nil]}, default: nil],
+                                 team_key: [type: {:or, [:string, nil]}, default: nil],
                                  assignee: [type: {:or, [:string, nil]}, default: nil],
                                  active_states: [
                                    type: {:list, :string},
@@ -242,6 +245,7 @@ defmodule SymphonyElixir.Config do
 
   @type workflow_payload :: Workflow.loaded_workflow()
   @type tracker_kind :: String.t() | nil
+  @type tracker_scope :: String.t()
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
           thread_sandbox: String.t(),
@@ -297,6 +301,17 @@ defmodule SymphonyElixir.Config do
   @spec linear_project_slug() :: String.t() | nil
   def linear_project_slug do
     get_in(validated_workflow_options(), [:tracker, :project_slug])
+  end
+
+  @spec linear_team_key() :: String.t() | nil
+  def linear_team_key do
+    get_in(validated_workflow_options(), [:tracker, :team_key])
+  end
+
+  @spec linear_scope() :: tracker_scope()
+  def linear_scope do
+    scope = get_in(validated_workflow_options(), [:tracker, :scope])
+    normalize_tracker_scope(scope) || @default_tracker_scope
   end
 
   @spec linear_assignee() :: String.t() | nil
@@ -530,7 +545,7 @@ defmodule SymphonyElixir.Config do
     with {:ok, _workflow} <- current_workflow(),
          :ok <- require_tracker_kind(),
          :ok <- require_linear_token(),
-         :ok <- require_linear_project(),
+         :ok <- require_linear_scope_target(),
          :ok <- require_valid_codex_runtime_settings() do
       require_codex_command()
     end
@@ -573,13 +588,26 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  defp require_linear_project do
+  defp require_linear_scope_target do
     case tracker_kind() do
       "linear" ->
-        if is_binary(linear_project_slug()) do
-          :ok
-        else
-          {:error, :missing_linear_project_slug}
+        case linear_scope() do
+          "project" ->
+            if is_binary(linear_project_slug()) and linear_project_slug() != "" do
+              :ok
+            else
+              {:error, :missing_linear_project_slug}
+            end
+
+          "team" ->
+            if is_binary(linear_team_key()) and linear_team_key() != "" do
+              :ok
+            else
+              {:error, :missing_linear_team_key}
+            end
+
+          other ->
+            {:error, {:invalid_linear_scope, other}}
         end
 
       _ ->
@@ -626,7 +654,9 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:kind, normalize_tracker_kind(scalar_string_value(Map.get(section, "kind"))))
     |> put_if_present(:endpoint, scalar_string_value(Map.get(section, "endpoint")))
     |> put_if_present(:api_key, binary_value(Map.get(section, "api_key"), allow_empty: true))
+    |> put_if_present(:scope, normalize_tracker_scope(scalar_string_value(Map.get(section, "scope"))))
     |> put_if_present(:project_slug, scalar_string_value(Map.get(section, "project_slug")))
+    |> put_if_present(:team_key, scalar_string_value(Map.get(section, "team_key")))
     |> put_if_present(:active_states, csv_value(Map.get(section, "active_states")))
     |> put_if_present(:paused_states, csv_value(Map.get(section, "paused_states")))
     |> put_if_present(:terminal_states, csv_value(Map.get(section, "terminal_states")))
@@ -1168,6 +1198,18 @@ defmodule SymphonyElixir.Config do
   end
 
   defp normalize_tracker_kind(_kind), do: nil
+
+  defp normalize_tracker_scope(scope) when is_binary(scope) do
+    scope
+    |> String.trim()
+    |> String.downcase()
+    |> case do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_tracker_scope(_scope), do: nil
 
   defp workflow_config do
     case current_workflow() do

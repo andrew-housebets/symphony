@@ -631,6 +631,66 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
   end
 
+  test "issue with overlapping module label is not dispatch-eligible while same module is running" do
+    running_issue = %Issue{
+      id: "running-1",
+      identifier: "MT-2001",
+      title: "Running enrichment task",
+      state: "In Progress",
+      labels: ["module: enrichment"]
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{
+        "running-1" => %{issue: running_issue}
+      },
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    candidate_issue = %Issue{
+      id: "candidate-1",
+      identifier: "MT-2002",
+      title: "Another enrichment task",
+      state: "Todo",
+      labels: ["Module: Enrichment", "frontend repo"]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(candidate_issue, state)
+  end
+
+  test "issue with different module label remains dispatch-eligible while another module is running" do
+    running_issue = %Issue{
+      id: "running-2",
+      identifier: "MT-2003",
+      title: "Running enrichment task",
+      state: "In Progress",
+      labels: ["module: enrichment"]
+    }
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{
+        "running-2" => %{issue: running_issue}
+      },
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    candidate_issue = %Issue{
+      id: "candidate-2",
+      identifier: "MT-2004",
+      title: "Ingestion task",
+      state: "Todo",
+      labels: ["Module: ingestion", "backend repo"]
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(candidate_issue, state)
+  end
+
   test "workspace remove returns error information for missing directory" do
     random_path =
       Path.join(
@@ -786,7 +846,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert Config.linear_endpoint() == "https://api.linear.app/graphql"
     assert Config.linear_api_token() == nil
+    assert Config.linear_scope() == "project"
     assert Config.linear_project_slug() == nil
+    assert Config.linear_team_key() == nil
     assert Config.workspace_root() == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert Config.workspace_source_repo_map() == %{default: [], label_overrides: %{}}
     assert Config.max_concurrent_agents() == 10

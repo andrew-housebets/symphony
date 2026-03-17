@@ -273,6 +273,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Linear project slug missing in WORKFLOW.md")
         state
 
+      {:error, :missing_linear_team_key} ->
+        Logger.error("Linear team key missing in WORKFLOW.md for tracker.scope=team")
+        state
+
+      {:error, {:invalid_linear_scope, scope}} ->
+        Logger.error("Invalid tracker.scope in WORKFLOW.md: #{inspect(scope)} (expected \"project\" or \"team\")")
+        state
+
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
@@ -605,8 +613,7 @@ defmodule SymphonyElixir.Orchestrator do
       !budget_issue_suppressed?(state, issue.id) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
-      available_slots(state) > 0 and
-      state_slots_available?(issue, running)
+      dispatch_slots_available?(issue, state)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states, _paused_states),
@@ -619,6 +626,56 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp state_slots_available?(_issue, _running), do: false
+
+  defp module_slots_available?(%Issue{} = issue, running) when is_map(running) do
+    issue_modules = issue_module_labels(issue)
+
+    cond do
+      MapSet.size(issue_modules) == 0 ->
+        true
+
+      true ->
+        Enum.all?(running, fn
+          {_id, %{issue: %Issue{} = running_issue}} ->
+            MapSet.disjoint?(issue_modules, issue_module_labels(running_issue))
+
+          _ ->
+            true
+        end)
+    end
+  end
+
+  defp module_slots_available?(_issue, _running), do: true
+
+  defp issue_module_labels(%Issue{labels: labels}) when is_list(labels) do
+    labels
+    |> Enum.reduce(MapSet.new(), fn
+      label, acc when is_binary(label) ->
+        normalized = normalize_module_label(label)
+        if normalized == nil, do: acc, else: MapSet.put(acc, normalized)
+
+      _label, acc ->
+        acc
+    end)
+  end
+
+  defp issue_module_labels(_issue), do: MapSet.new()
+
+  defp normalize_module_label(label) when is_binary(label) do
+    normalized_label =
+      label
+      |> String.trim()
+      |> String.downcase()
+
+    case Regex.run(~r/^module\s*:\s*(.+)$/u, normalized_label, capture: :all_but_first) do
+      [module_name] ->
+        normalized_module_name = String.trim(module_name)
+        if normalized_module_name == "", do: nil, else: normalized_module_name
+
+      _ ->
+        nil
+    end
+  end
 
   defp running_issue_count_for_state(running, issue_state) when is_map(running) do
     normalized_state = normalize_issue_state(issue_state)
@@ -1866,7 +1923,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
-    available_slots(state) > 0 and state_slots_available?(issue, state.running)
+    available_slots(state) > 0 and
+      state_slots_available?(issue, state.running) and
+      module_slots_available?(issue, state.running)
   end
 
   defp apply_codex_token_delta(
